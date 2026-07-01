@@ -1,0 +1,24 @@
+# Dependencies / build / generated
+node_modules
+.next
+out
+build
+coverage
+package-lock.json
+src/generated
+
+# Local embedded-postgres data
+.pgdata
+.pgdata-test
+
+# Workflow files are kept out of feature PRs — GitHub's merge API can silently drop
+# .github/workflows/* changes. Format/edit them only in dedicated CI issues (#58/#59).
+.github/workflows/
+
+# In-flight automation work (owned by its own issue) — format there, not in #29.
+docs/automation.md
+
+# Markdown left unformatted for now: prose/design/governance docs (CLAUDE.md,
+# docs/architecture.md, FLOW.md, README.md, SECURITY.md). Avoids noisy churn and
+# touching shared docs in a tooling PR. Can revisit in its own change.
+*.md

@@ -7,7 +7,15 @@ export const logger = pino({
   level: process.env.LOG_LEVEL ?? (process.env.NODE_ENV === "production" ? "info" : "debug"),
   // Never log secrets. Redact common sensitive paths defensively.
   redact: {
-    paths: ["password", "*.password", "token", "*.token", "authorization", "*.authorization", "DATABASE_URL"],
+    paths: [
+      "password",
+      "*.password",
+      "token",
+      "*.token",
+      "authorization",
+      "*.authorization",
+      "DATABASE_URL",
+    ],
     censor: "[redacted]",
   },
 });
