@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      # Tests spin up an ephemeral embedded-postgres (PG18) via the Vitest global setup,
+      # apply migrations, seed two orgs, and assert RLS isolation + activity_log immutability.
+      # No external services required.
+      - name: Test (RLS + immutability)
+        run: npm test
+
+      - name: Build
+        run: npm run build
