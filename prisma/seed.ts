@@ -14,18 +14,35 @@ export interface SeedResult {
 
 async function seedOrg(
   db: PrismaClient,
-  opts: { name: string; slug: string; timezone: string; country: string; locale: string; ownerEmail: string },
+  opts: {
+    name: string;
+    slug: string;
+    timezone: string;
+    country: string;
+    locale: string;
+    ownerEmail: string;
+  },
 ) {
   const org = await db.organization.upsert({
     where: { slug: opts.slug },
     update: {},
-    create: { name: opts.name, slug: opts.slug, defaultTimezone: opts.timezone, defaultLocale: opts.locale },
+    create: {
+      name: opts.name,
+      slug: opts.slug,
+      defaultTimezone: opts.timezone,
+      defaultLocale: opts.locale,
+    },
   });
 
   const owner = await db.user.upsert({
     where: { email: opts.ownerEmail },
     update: {},
-    create: { email: opts.ownerEmail, name: `${opts.name} Owner`, emailVerified: true, locale: opts.locale },
+    create: {
+      email: opts.ownerEmail,
+      name: `${opts.name} Owner`,
+      emailVerified: true,
+      locale: opts.locale,
+    },
   });
 
   await db.membership.upsert({
@@ -68,7 +85,9 @@ async function seedOrg(
   return org.id;
 }
 
-export async function seed(connectionString = process.env.SUPERUSER_DATABASE_URL): Promise<SeedResult> {
+export async function seed(
+  connectionString = process.env.SUPERUSER_DATABASE_URL,
+): Promise<SeedResult> {
   if (!connectionString) {
     throw new Error("SUPERUSER_DATABASE_URL is not set (seeding must bypass RLS as superuser)");
   }

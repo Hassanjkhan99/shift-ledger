@@ -6,7 +6,12 @@ import { startCluster, bootstrapRoleAndDb, APP_DB, APP_USER } from "./pg.mjs";
 const PORT = 5432;
 const DATA_DIR = "./.pgdata";
 
-const cluster = await startCluster({ port: PORT, dataDir: DATA_DIR, persistent: true, quiet: true });
+const cluster = await startCluster({
+  port: PORT,
+  dataDir: DATA_DIR,
+  persistent: true,
+  quiet: true,
+});
 await bootstrapRoleAndDb({ port: PORT });
 
 console.log(`\n  Shift Ledger dev Postgres 18 is up`);
@@ -20,7 +25,9 @@ const shutdown = async () => {
   if (stopping) return;
   stopping = true;
   console.log("\nstopping dev Postgres...");
-  try { await cluster.stop(); } catch {}
+  try {
+    await cluster.stop();
+  } catch {}
   process.exit(0);
 };
 process.on("SIGINT", shutdown);

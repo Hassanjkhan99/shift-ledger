@@ -7,7 +7,8 @@ export default defineConfig({
     globalSetup: ["./tests/global-setup.ts"],
     env: {
       DATABASE_URL: "postgresql://app_user:app_user@localhost:5433/shift_ledger?schema=public",
-      SUPERUSER_DATABASE_URL: "postgresql://postgres:postgres@localhost:5433/shift_ledger?schema=public",
+      SUPERUSER_DATABASE_URL:
+        "postgresql://postgres:postgres@localhost:5433/shift_ledger?schema=public",
       NODE_ENV: "test",
     },
     // Serialize test files so they share the single embedded Postgres cluster.

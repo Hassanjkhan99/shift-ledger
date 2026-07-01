@@ -67,7 +67,12 @@ describe("RLS cross-tenant isolation (app_user connection)", () => {
     await expect(
       withTenant(orgAId, (tx) =>
         tx.property.create({
-          data: { organizationId: orgBId, name: "sneaky", timezone: "Europe/Berlin", countryCode: "DE" },
+          data: {
+            organizationId: orgBId,
+            name: "sneaky",
+            timezone: "Europe/Berlin",
+            countryCode: "DE",
+          },
         }),
       ),
     ).rejects.toThrow();
