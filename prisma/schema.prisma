@@ -1,0 +1,197 @@
+// Shift Ledger — Milestone 1 foundation schema.
+// Conventions (CTO decisions): UUID v7 PKs (DB-generated, PG18 native uuidv7()),
+// organization_id on every tenant-scoped table, timestamptz, soft-delete via deleted_at
+// (except append-only tables). RLS + FORCE, policies, and the activity_log append-only
+// trigger are applied via raw SQL in a follow-up migration (Prisma cannot express them).
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---- Canonical enums (per CTO decisions D1/D2/F8) -------------------------------
+// Only the enums used by Milestone-1 tables are defined here. The task/exception/
+// corrective-action status enums land with their tables in later milestones; their
+// canonical values are already locked in D1/D2.
+
+enum OrgRole {
+  Owner
+  OrgAdmin
+  PropertyManager
+  KitchenManager
+  ShiftLeader
+  Staff
+  Auditor
+  ExternalInspector
+
+  @@map("org_role")
+}
+
+enum InvitationStatus {
+  pending
+  accepted
+  revoked
+  expired
+
+  @@map("invitation_status")
+}
+
+enum ActivitySubjectType {
+  organization
+  property
+  outlet
+  membership
+  invitation
+  user
+
+  @@map("activity_subject_type")
+}
+
+// ---- Global identity (NOT tenant-scoped, global by design) ----------------------
+
+model User {
+  id            String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  email         String    @unique
+  emailVerified Boolean   @default(false) @map("email_verified")
+  name          String?
+  locale        String?
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt     DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  memberships     Membership[]
+  invitationsSent Invitation[] @relation("InvitedBy")
+
+  @@map("users")
+}
+
+// ---- Tenant root ----------------------------------------------------------------
+
+model Organization {
+  id              String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  name            String
+  slug            String    @unique
+  defaultLocale   String    @default("de") @map("default_locale")
+  defaultTimezone String    @default("Europe/Berlin") @map("default_timezone")
+  retentionDays   Int       @default(1095) @map("retention_days") // D5/F8: 3y default, per-org configurable
+  legalHold       Boolean   @default(false) @map("legal_hold")
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  memberships  Membership[]
+  invitations  Invitation[]
+  properties   Property[]
+  outlets      Outlet[]
+  activityLogs ActivityLog[]
+
+  @@map("organizations")
+}
+
+// ---- Tenant-scoped tables (organization_id on every one) ------------------------
+
+model Membership {
+  id             String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  role           OrgRole
+  propertyScope  String[]  @map("property_scope") @db.Uuid // empty = whole org; else limited to these property ids
+  status         String    @default("active")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@unique([organizationId, userId])
+  @@index([userId])
+  @@index([organizationId, role])
+  @@map("memberships")
+}
+
+model Invitation {
+  id             String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  email          String
+  role           OrgRole
+  propertyScope  String[]         @map("property_scope") @db.Uuid
+  token          String           @unique
+  status         InvitationStatus @default(pending)
+  invitedById    String           @map("invited_by") @db.Uuid
+  expiresAt      DateTime         @map("expires_at") @db.Timestamptz(6)
+  acceptedAt     DateTime?        @map("accepted_at") @db.Timestamptz(6)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime?        @map("deleted_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  invitedBy    User         @relation("InvitedBy", fields: [invitedById], references: [id])
+
+  @@index([organizationId, status])
+  @@index([organizationId, email])
+  @@map("invitations")
+}
+
+model Property {
+  id             String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  name           String
+  timezone       String // IANA — source of truth for occurrence wall-clock (later milestones)
+  countryCode    String    @map("country_code") @db.Char(2)
+  addressJson    Json?     @map("address_json")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  outlets      Outlet[]
+
+  @@unique([organizationId, name])
+  @@index([organizationId, deletedAt])
+  @@map("properties")
+}
+
+model Outlet {
+  id             String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  propertyId     String    @map("property_id") @db.Uuid
+  name           String
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  property     Property     @relation(fields: [propertyId], references: [id])
+
+  @@unique([propertyId, name])
+  @@index([organizationId, propertyId, deletedAt])
+  @@map("outlets")
+}
+
+// Append-only audit log. No updated_at / deleted_at. UPDATE/DELETE rejected by a
+// database trigger (see the rls_immutability migration). Per-org dense seq + hash
+// chain (F6) is deferred to a later milestone; seq here is a global ordering sequence.
+model ActivityLog {
+  id             String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String              @map("organization_id") @db.Uuid
+  seq            BigInt              @default(autoincrement())
+  subjectType    ActivitySubjectType @map("subject_type")
+  subjectId      String              @map("subject_id") @db.Uuid
+  action         String
+  actorUserId    String?             @map("actor_user_id") @db.Uuid
+  actorLabel     String?             @map("actor_label")
+  beforeJson     Json?               @map("before_json")
+  afterJson      Json?               @map("after_json")
+  reason         String?
+  createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, subjectType, subjectId, seq])
+  @@index([organizationId, createdAt])
+  @@map("activity_log")
+}
