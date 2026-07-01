@@ -1,0 +1,70 @@
+name: Standup — Board Report (keyless)
+
+# Deterministic weekday standup. No LLM, no API key, no cost beyond free Actions minutes.
+# Read-only: queries issues/PRs with the built-in GITHUB_TOKEN and writes a report to the
+# run's Step Summary. See docs/automation.md.
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # GitHub Actions cron is UTC. 05:00 UTC = 10:00 Asia/Karachi (PKT, UTC+5), Mon–Fri.
+    - cron: "0 5 * * 1-5"
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+concurrency:
+  group: standup
+  cancel-in-progress: false
+
+jobs:
+  standup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build standup report
+        shell: bash
+        run: |
+          set -euo pipefail
+          S="$GITHUB_STEP_SUMMARY"
+          echo "# Shift Ledger — Standup ($(date -u '+%Y-%m-%d %H:%M UTC'))" >> "$S"
+
+          echo -e "\n## Open issues" >> "$S"
+          gh issue list --repo "$REPO" --state open --limit 100 \
+            --json number,title,labels,assignees \
+            --jq '.[] | "- #\(.number) \(.title) [\(.labels|map(.name)|join(", "))]\(if (.assignees|length)>0 then " @\(.assignees|map(.login)|join(",@"))" else "" end)"' \
+            >> "$S" || echo "_none_" >> "$S"
+
+          echo -e "\n## auto:approved — queued for implementation" >> "$S"
+          gh issue list --repo "$REPO" --state open --label "auto:approved" \
+            --json number,title --jq '.[] | "- #\(.number) \(.title)"' >> "$S" 2>/dev/null || true
+          gh issue list --repo "$REPO" --state open --label "auto:approved" --json number --jq 'if length==0 then "_none_" else empty end' >> "$S" || true
+
+          echo -e "\n## proposed — awaiting your acceptance" >> "$S"
+          gh issue list --repo "$REPO" --state open --label "proposed" \
+            --json number,title --jq 'if length==0 then "_none_" else (.[] | "- #\(.number) \(.title)") end' >> "$S" || true
+
+          echo -e "\n## Stale — assigned, no activity >2 days" >> "$S"
+          gh issue list --repo "$REPO" --state open --limit 100 \
+            --json number,title,updatedAt,assignees \
+            --jq '[.[] | select((.assignees|length)>0) | select((now - (.updatedAt|fromdateiso8601)) > 172800) | "- #\(.number) \(.title) (updated \(.updatedAt))"] | if length==0 then "_none_" else .[] end' \
+            >> "$S" || true
+
+          echo -e "\n## Open PRs + CI" >> "$S"
+          gh pr list --repo "$REPO" --state open \
+            --json number,title,isDraft,statusCheckRollup,labels \
+            --jq '.[] | "- #\(.number) \(.title)\(if .isDraft then " (draft)" else "" end) — CI: \((.statusCheckRollup // []) | if length==0 then "none" elif (map(select((.conclusion // .state) as $c | $c!="SUCCESS" and $c!="NEUTRAL" and $c!="SKIPPED")) | length) > 0 then "❌" else "✅" end)\(if (.labels|map(.name)|index("qa:evidence-attached")) then " · evidence ✓" else "" end)"' \
+            >> "$S" || echo "_none_" >> "$S"
+
+          echo -e "\n## TODO / FIXME in tree (candidates for \`proposed\` issues)" >> "$S"
+          grep -rInE "TODO|FIXME|HACK" --include="*.ts" --include="*.tsx" src tests 2>/dev/null \
+            | head -40 | sed 's/^/- /' >> "$S" || true
+
+          echo -e "\n---\n_Read-only report. Nothing was changed. See docs/automation.md._" >> "$S"
