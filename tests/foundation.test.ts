@@ -49,11 +49,46 @@ describe("RLS cross-tenant isolation (app_user connection)", () => {
     expect(leaked).toBeNull();
   });
 
-  it("no tenant context => default-deny (zero rows), proving no pooled-connection GUC leak", async () => {
+  it("no tenant context => default-deny across EVERY tenant table (zero rows)", async () => {
     // No withTenant() wrapper: the GUC is unset/empty -> RLS returns nothing (NULLIF guards
     // against the empty-string reset value a rolled-back transaction-local GUC leaves behind).
-    const props = await prisma.property.findMany();
-    expect(props).toEqual([]);
+    const counts = await Promise.all([
+      prisma.organization.count(),
+      prisma.membership.count(),
+      prisma.invitation.count(),
+      prisma.property.count(),
+      prisma.outlet.count(),
+      prisma.activityLog.count(),
+    ]);
+    expect(counts).toEqual([0, 0, 0, 0, 0, 0]);
+  });
+
+  it("cross-tenant WRITE is denied: cannot insert a row tagged for another org (WITH CHECK)", async () => {
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.property.create({
+          data: { organizationId: orgBId, name: "sneaky", timezone: "Europe/Berlin", countryCode: "DE" },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("cross-tenant UPDATE is denied: another org's row is invisible, so the update hits nothing", async () => {
+    const bProp = await withTenant(orgBId, (tx) => tx.property.findFirst());
+    expect(bProp).not.toBeNull();
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.property.update({ where: { id: bProp!.id }, data: { name: "hijacked" } }),
+      ),
+    ).rejects.toThrow(); // P2025: record not found (hidden by RLS)
+  });
+
+  it("cross-tenant DELETE is denied: another org's row is invisible, so the delete hits nothing", async () => {
+    const bOutlet = await withTenant(orgBId, (tx) => tx.outlet.findFirst());
+    expect(bOutlet).not.toBeNull();
+    await expect(
+      withTenant(orgAId, (tx) => tx.outlet.delete({ where: { id: bOutlet!.id } })),
+    ).rejects.toThrow();
   });
 });
 
