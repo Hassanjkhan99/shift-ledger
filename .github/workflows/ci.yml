@@ -5,35 +5,50 @@ on:
     branches: [main]
   pull_request:
 
+# Separate, independently-reported gates so a red check is attributable at a glance:
+#   build = typecheck + lint + next build
+#   qa    = Vitest (cross-tenant RLS leak gate + activity_log immutability), on ephemeral embedded PG18
+# The E2E gate (Playwright: server boot + key route) is tracked in #59 and added later as its own job.
+# Both gates run in parallel — no `needs:` — so build and test failures never mask each other.
+
 jobs:
-  build-and-test:
+  build:
+    name: Build gate
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 22
           cache: npm
-
       - name: Install dependencies
         run: npm ci
-
       - name: Generate Prisma client
         run: npx prisma generate
-
-      - name: Lint
-        run: npm run lint
-
       - name: Typecheck
         run: npm run typecheck
-
-      # Tests spin up an ephemeral embedded-postgres (PG18) via the Vitest global setup,
-      # apply migrations, seed two orgs, and assert RLS isolation + activity_log immutability.
-      # No external services required.
-      - name: Test (RLS + immutability)
-        run: npm test
-
+      - name: Lint
+        run: npm run lint
       - name: Build
         run: npm run build
+
+  qa:
+    name: QA gate (tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Generate Prisma client
+        run: npx prisma generate
+      # Ephemeral embedded-postgres (PG18) via the Vitest global setup: applies migrations,
+      # seeds two orgs, then asserts cross-tenant isolation (read/write/update/delete denial)
+      # and activity_log append-only immutability. No external services required.
+      - name: Test (RLS leak gate + immutability)
+        run: npm test
