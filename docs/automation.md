@@ -8,7 +8,8 @@
 | Layer | Runs where | Cost | LLM? |
 |---|---|---|---|
 | **Standup / board report** | GitHub Actions (`standup.yml`) | Free Actions minutes | No |
-| **QA evidence** | GitHub Actions (`qa-evidence.yml`) | Free Actions minutes | No |
+| **QA evidence (CI passed)** | GitHub Actions (`qa-evidence.yml`) | Free Actions minutes | No |
+| **QA dev-evidence sweep** | Claude Code headless, nightly (`scripts/qa-evidence-sweep.ps1`) | Existing seat | Yes |
 | **Local AI standup** | Claude Code scheduled task on the dev machine | Existing seat | Yes |
 | **Implementation & smart work** | You in Claude Code, locally | Existing seat | Yes |
 
@@ -38,6 +39,8 @@ activity: open a Claude Code session and ask it to implement a specific issue.
 | `proposed` | Suggested issue awaiting a human to accept (remove label = accepted). |
 | `automated` | Created/updated by automation. |
 | `qa:evidence-attached` | `qa-evidence.yml` confirmed CI passed and attached evidence. |
+| `qa:dev-evidence` | Dev evidence (screenshot / query-policy proof / targeted test output) attached by the `qa-evidence` skill or nightly sweep. |
+| `qa:needs-dev-evidence` | Done/QA issue still missing dev evidence the nightly sweep couldn't auto-produce — needs a human. |
 
 ## Board mapping (from CLAUDE.md §5) — verified accurate 2026-07-02
 - Repo: `Hassanjkhan99/shift-ledger` · Project: https://github.com/users/Hassanjkhan99/projects/1
@@ -54,7 +57,21 @@ activity: open a Claude Code session and ask it to implement a specific issue.
 2. **`qa-evidence.yml`** (after CI succeeds on a PR) — posts passing-CI evidence to the PR and its
    linked issue, adds `qa:evidence-attached`. Idempotent. Never merges/closes.
 
+## Local scheduled runners (Claude Code, existing seat)
+
+- **`scripts/qa-evidence-sweep.ps1`** (nightly — e.g. 02:00 via Windows Task Scheduler) drives
+  Claude Code headless to run the `qa-evidence` skill in **sweep mode**: it audits the board for
+  `QA (evidence)` / `Done` issues missing `qa:dev-evidence`, backfills the evidence CI can't produce
+  (targeted test output, query/policy proof), and flags UI/screenshot gaps as `qa:needs-dev-evidence`.
+  **Read + comment + label only** — never merges, closes, pushes, or moves a card to Done (enforced by
+  a narrow tool allowlist + explicit prompt rules). Logs to `/.logs/` (git-ignored). It runs locally
+  because the keyless `GITHUB_TOKEN` can neither move Projects v2 columns nor produce dev-specific evidence.
+
 ## Local implementation flow (the "implementer", free)
+
+The steps below are encoded as Claude Code skills in `.claude/skills/` — `start-issue`, `new-action`,
+`open-pr`, and `qa-evidence` — so each ritual (branch / board / PR / evidence) runs the same way every time.
+
 1. Label the issue `auto:approved` when you're ready.
 2. In a Claude Code session in this repo: "Implement issue #<n> per its scope and docs/automation.md."
 3. It branches `feat/<#>-<slug>`, implements, adds tests, and runs the gate before opening a PR:
