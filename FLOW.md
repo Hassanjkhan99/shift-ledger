@@ -5,13 +5,16 @@ catch up fast. Detail lives in [`docs/architecture.md`](docs/architecture.md) (f
 design + decisions D1–D13, F1–F8), [`SECURITY.md`](SECURITY.md), and [`CLAUDE.md`](CLAUDE.md)
 (working agreement). Update this at the end of each working session.
 
-_Last updated: 2026-07-02._
+_Last updated: 2026-07-03._
 
 ## Status snapshot
-- **M0 — Design sprint:** ✅ complete (design system: shadcn/ui + Radix + Tailwind v4, OKLCH tokens, self-hosted Geist/GDPR; 49 components; 14 screens; light + dark).
-- **M1 — Backend Foundation & RLS Proof:** ✅ **merged to `main`** — schema + RLS gate + seed + CI, plus the full scaffold epic (**#2**). Product UI still to come.
-- **Scaffold epic #2:** ✅ complete — CI gates, Prettier/pre-commit, conventions, health route, keyless automation, and Vercel are all on `main`.
-- **In flight:** **Better Auth #39–#42** (epic #4) — separate conversation. Playwright E2E **#59** — its own conversation.
+
+| Milestone | Status | Notes |
+|---|---|---|
+| **M0 — Design sprint** | ✅ complete (QA gate pending) | 49 components, 14 screens, light + dark. #27 in QA (evidence); #24/#25/#26 done — human sign-off closes #1 parent epic. |
+| **M1 — Backend Foundation** | ✅ merged to `main` | Schema + RLS gate + seed + CI + scaffold + Better Auth + Prisma tenant-guard. |
+| **M1 — Neon EU** | 🔴 human-gated | #34 / #3 — credentials needed; Vercel env slots have placeholders. |
+| **M2 — Feature layer** | ⬜ not started | Next milestone: occurrence lifecycle, exceptions, state machines, F2–F5 correctness. |
 
 ## What's on `main`
 **Foundation (M1):**
@@ -28,6 +31,12 @@ _Last updated: 2026-07-02._
 - **Vercel (#31):** project `shift-ledger`, **EU function region `fra1`** (Frankfurt, data residency), Preview + Production env tiers. Env slots `DATABASE_URL` / `SUPERUSER_DATABASE_URL` / `LOG_LEVEL` wired (DB URLs are **placeholders** until Neon lands — #34/#3). **D13 prod-guard** (`src/lib/prod-guard.ts`, via `instrumentation.ts`) fails closed on dev shortcuts / dev DB creds under `NODE_ENV=production`. Production deploy verified **● Ready in `fra1`**.
 - **`.gitattributes`** `* text=auto eol=lf` (#72) — repo is LF everywhere; local `format:check` now matches CI.
 
+**Better Auth — all sub-issues merged to `main` (#39–#42, epic #4):**
+- #39 Install & configure Better Auth · #40 Sign-up/in/out flows · #41 Org-aware session (`active_organization_id` → RLS GUC) · #42 Role model + permission checks (D7).
+
+**CI tenant-guard — merged to `main` (PR #77, issue #70):**
+- ESLint rule rejecting raw `prisma.*` calls outside `withTenant()`. Enforces D6 at the static-analysis layer before CI runs.
+
 ## Key decisions / deviations (recorded in SECURITY.md)
 - Docker unavailable on dev machine → **embedded-postgres (PG18)**; prod unchanged (Neon EU). PG18 gives native `uuidv7()`.
 - **Next.js 16** and **Prisma 7** (current stable) — App Router + driver-adapter patterns unchanged.
@@ -41,9 +50,60 @@ _Last updated: 2026-07-02._
 - Repo: Hassanjkhan99/shift-ledger · Board: Projects v2, pipeline `Backlog → Ready → In Progress → In Review → QA (evidence) → Done`.
 - Issue-first; one issue → one branch → one PR → one QA-evidence comment; agent never self-approves. See [`CLAUDE.md`](CLAUDE.md).
 - **CI/workflow changes go in a dedicated CI issue** and **merge via the GitHub web UI** — the merge API can silently drop `.github/workflows/*`.
-- Recently moved to **Done:** #29, #30, #33, #58, #63, #31, #72.
+- Recently moved to **Done:** #29, #30, #33, #58, #63, #31, #72, #56, #70, #75 + all M1 sub-issues (#28, #32, #35–#51).
+
+## Milestone → open issues map
+
+### M0 — Design sprint (QA gate)
+| Issue | Title | Status |
+|---|---|---|
+| #1 | M0 parent epic | open (closes when #27 Done) |
+| #24 | Hi-fi designs: 14 screens | done, human sign-off pending |
+| #25 | 6 core user flows | done, human sign-off pending |
+| #26 | Component inventory + design tokens | done, human sign-off pending |
+| #27 | Design review & approval | **QA (evidence)** — evidence posted 2026-07-03 |
+
+### M1 — Foundation (human-gated remainder)
+| Issue | Title | Status |
+|---|---|---|
+| #2 | Scaffold Next.js monolith | done — close manually |
+| #3 | Provision Neon + Prisma + UUIDv7 | Prisma/UUIDv7 done; Neon blocked on #34 |
+| #4 | Integrate Better Auth (epic) | done — sub-issues #39–42 all closed; close manually |
+| #7 | F1–F8 correctness principles | F6/F7/F8 done; F2–F5 are M2 issues (#52–55) |
+| #34 | Provision Neon EU + pooled connection | 🔴 **human action** — credentials + Vercel env swap |
+
+### M2 — Feature layer (next milestone)
+Correctness foundations first, then occurrence lifecycle:
+
+| Issue | Title |
+|---|---|
+| #52 | F2: idempotency keys (`client_submission_id`) on writes |
+| #53 | F3: server-authoritative timestamps (`recorded_at`) |
+| #54 | F4: single state-transition choke point → `activity_log` |
+| #55 | F5: keyset pagination utility + convention |
+| #8 | Occurrence lifecycle enum + generation (Inngest) |
+| #9 | Exception + corrective-action state machines |
+| #10 | Single state-transition choke point → `activity_log` |
+| #11 | Shared-tablet actor identity + correction-version permissions |
+| #69 | Shared-tablet PIN: issuance, storage, verification |
+
+### M3 — Storage, evidence, exports
+#12 R2 + attachments · #13 SHA-256 hash chain · #14 PDF audit pack
+
+### M4 — Product UI
+#15 GraphQL (yoga + Pothos + DataLoader) · #16 Today dashboard · #17 Server Actions + idempotency
+
+### M5 — Hardening + observability
+#18 Retention · #19 GraphQL hardening · #20 Inngest + IndexedDB queue · #21 Sentry + pino + Resend
+
+### Tooling / process (parallel)
+#59 Playwright E2E · #60 Working agreement update · #62 Decision journal
+
+### Validation (human)
+#22 DE/NL legal retention number · #23 Walk-in connectivity reality check
 
 ## Next
-1. **Better Auth #39–#42** (epic #4, separate conversation): #39 install/config → #40 sign-up/in/out → #41 org-aware session (active `organization_id` → RLS GUC) → #42 role model + permission checks (D7). Core-auth-only (no Better Auth org plugin — the app owns tenancy); open self-signup provisions a first org + Owner via a `provisionOrganization()` path that respects RLS.
-2. **Neon EU #34 / #3:** provision the DB (non-superuser app role) + pooled connection; swap the placeholder Vercel env values for real ones.
-3. Then M2 feature work (occurrence lifecycle, exception/corrective-action state machines, tablet identity).
+1. **Neon EU #34** — provision Neon DB (non-superuser `app_user` role), swap Vercel placeholder env values. Human action; unblocks prod deploy.
+2. **Close stale M1 epics** — #2, #4 are done; close them to keep the board clean.
+3. **M0 sign-off** — human review of #24, #25, #26, #27 → close all → close #1.
+4. **M2 start** — pick up #52 (F2 idempotency keys) as the first M2 issue; order: #52→#53→#54→#55→#8→#9.
