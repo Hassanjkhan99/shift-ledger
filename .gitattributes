@@ -1,0 +1,13 @@
+# Enforce LF line endings for all text files so tooling is consistent across OSes and
+# CI. In particular `prettier --check` uses endOfLine=lf; without this, CRLF-committed
+# blobs fail the Format gate on Linux runners. Binary files are auto-detected and left
+# untouched; a few common types are pinned explicitly for safety.
+* text=auto eol=lf
+
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.woff binary
+*.woff2 binary
