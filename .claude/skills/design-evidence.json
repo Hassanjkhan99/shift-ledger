@@ -1,0 +1,10 @@
+{
+  "name": "design-evidence",
+  "type": "executable",
+  "command": "bash",
+  "args": [".claude/skills/design-evidence.sh"],
+  "description": "Extract design handoff zip, serve artifacts, and generate GitHub evidence comments",
+  "help": "Usage: /design-evidence --zip <path> [--screens <files>] [--issue <#>] [--repo <owner/repo>]\n\nExamples:\n  /design-evidence --zip shadcnui Design System-handoff.zip\n  /design-evidence --zip design.zip --screens manager.html,index.html --issue 27\n  /design-evidence --zip design.zip --issue 27 --repo Hassanjkhan99/shift-ledger\n\nOptions:\n  --zip <path>          Path to design handoff zip (required)\n  --screens <files>     Comma-separated HTML files to serve (default: manager.html,index.html,audit-export.html)\n  --issue <#>          GitHub issue number to post comment to (optional)\n  --repo <owner/repo>   GitHub repo (default: current repo)\n\nOutputs:\n  - Extracts design artifacts to docs/evidence/design-handoff-<timestamp>/\n  - Generates COMMENT.md with GitHub-ready evidence\n  - Starts local static server for viewing/screenshotting\n  - Optionally posts comment to GitHub issue\n",
+  "environment": ["bash", "unzip", "python3|python|npx"],
+  "workspace": "per-session"
+}
