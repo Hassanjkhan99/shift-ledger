@@ -22,6 +22,7 @@
 import { DateTime } from "luxon";
 import { z } from "zod";
 import { CheckType, RecurrenceFreq } from "../generated/prisma/enums";
+import type { OccurrenceStatus } from "../generated/prisma/enums";
 import type { TenantClient } from "./db";
 import { transition, logActivity } from "./transition";
 
@@ -395,4 +396,78 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
   }
 
   return { becameDue, becameOverdue };
+}
+
+// ---- Manager occurrence edges with mandatory reason (#10; §7.1) -----------------
+// The two §7.1 USER edges that do not depend on the completion flow (which lands with the completion
+// Server Action in M4 #17). Both require a reason (D7) and route through the F4 choke point.
+//
+// SCOPE BOUNDARY: due→completed / overdue→completed_late / due|overdue→failed are NOT built here —
+// they need pass/fail evaluation and are the completion Server Action (M4 #17). This module only owns
+// the skip/cancel edges, which have no completion dependency. The failed transition (M4 #17) is what
+// invokes evaluateRepeatedDeviation() (src/lib/repeated-deviation.ts).
+
+/** Actor of a manager-triggered occurrence edge. `reason` is mandatory (enforced by transition()). */
+export interface OccurrenceActor {
+  actorUserId: string;
+  reason: string;
+}
+
+/** Legal `from` statuses per §7.1. skipped: pending|due|overdue. cancelled: pending|due. */
+const SKIP_FROM: OccurrenceStatus[] = ["pending", "due", "overdue"];
+const CANCEL_FROM: OccurrenceStatus[] = ["pending", "due"];
+
+async function occurrenceManagerEdge(
+  tx: TenantClient,
+  occurrenceId: string,
+  legalFrom: OccurrenceStatus[],
+  to: OccurrenceStatus,
+  action: string,
+  actor: OccurrenceActor,
+): Promise<{ id: string; status: OccurrenceStatus }> {
+  const current = await tx.taskOccurrence.findUniqueOrThrow({
+    where: { id: occurrenceId },
+    select: { status: true, organizationId: true },
+  });
+  if (!legalFrom.includes(current.status)) {
+    throw new Error(
+      `occurrence: illegal transition to '${to}' from status '${current.status}' ` +
+        `(legal from: ${legalFrom.join(", ")})`,
+    );
+  }
+
+  return transition(tx, {
+    organizationId: current.organizationId,
+    subjectType: "taskOccurrence",
+    subjectId: occurrenceId,
+    action,
+    actorUserId: actor.actorUserId,
+    before: { status: current.status },
+    after: { status: to },
+    reason: actor.reason,
+    requireReason: true, // §7.1 / D7: skip & cancel require a reason
+    mutate: (t) =>
+      t.taskOccurrence.update({
+        where: { id: occurrenceId },
+        data: { status: to },
+        select: { id: true, status: true },
+      }),
+  });
+}
+
+/** pending|due|overdue → skipped. Manager marks the occurrence not-applicable, with a reason. */
+export function skipOccurrence(tx: TenantClient, occurrenceId: string, actor: OccurrenceActor) {
+  return occurrenceManagerEdge(tx, occurrenceId, SKIP_FROM, "skipped", "occurrence.skipped", actor);
+}
+
+/** pending|due → cancelled. Occurrence voided (schedule changed/deleted), with a reason. */
+export function cancelOccurrence(tx: TenantClient, occurrenceId: string, actor: OccurrenceActor) {
+  return occurrenceManagerEdge(
+    tx,
+    occurrenceId,
+    CANCEL_FROM,
+    "cancelled",
+    "occurrence.cancelled",
+    actor,
+  );
 }
