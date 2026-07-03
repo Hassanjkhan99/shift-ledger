@@ -73,6 +73,14 @@ enum RecurrenceFreq {
   @@map("recurrence_freq")
 }
 
+// Completion outcome (§8.14). pass/fail only — the D1 occurrence lifecycle carries the richer states.
+enum CompletionResult {
+  pass
+  fail
+
+  @@map("completion_result")
+}
+
 // Canonical per D1/F8 (§7.1). The §9.3 prose table's `scheduled` is drift — `pending` is correct.
 enum OccurrenceStatus {
   pending
@@ -125,6 +133,7 @@ model User {
 
   scheduledTasks  ScheduledTask[]  @relation("ScheduledTaskAssignee")
   taskOccurrences TaskOccurrence[] @relation("TaskOccurrenceAssignee")
+  taskCompletions TaskCompletion[] @relation("TaskCompletionCompletedBy")
 
   @@map("users")
 }
@@ -151,6 +160,8 @@ model Organization {
   taskTemplates   TaskTemplate[]
   scheduledTasks  ScheduledTask[]
   taskOccurrences TaskOccurrence[]
+  taskCompletions TaskCompletion[]
+  evidence        Evidence[]
 
   @@map("organizations")
 }
@@ -355,6 +366,7 @@ model TaskOccurrence {
   scheduledTask ScheduledTask @relation(fields: [scheduledTaskId], references: [id])
   taskTemplate  TaskTemplate  @relation(fields: [taskTemplateId], references: [id])
   assigneeUser  User?         @relation("TaskOccurrenceAssignee", fields: [assigneeUserId], references: [id])
+  completions   TaskCompletion[]
 
   @@unique([scheduledTaskId, occurrenceLocalDate])
   @@index([organizationId, propertyId, outletId, occurrenceLocalDate, status])
@@ -365,4 +377,65 @@ model TaskOccurrence {
   @@index([organizationId, assigneeUserId, occurrenceLocalDate])
   @@index([organizationId, status, occurrenceLocalDate])
   @@map("task_occurrences")
+}
+
+// ---- Compliance records (#53; §8.14 task_completions, §8.15 evidence) -----------
+// IMMUTABLE / append-only: NO updated_at, NO deleted_at. UPDATE/DELETE/TRUNCATE are rejected by
+// DB triggers (see the completions_evidence migration), mirroring activity_log. Corrections do
+// NOT mutate a row — they insert a new version (version+1, supersedes_id) via a SECURITY DEFINER
+// path deferred to M4 #17. F3: recorded_at is server-authoritative (DB DEFAULT now()), never set
+// by the client; client_reported_at is the device's self-reported time, advisory only.
+
+model TaskCompletion {
+  id                      String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId          String           @map("organization_id") @db.Uuid
+  taskOccurrenceId        String           @map("task_occurrence_id") @db.Uuid
+  version                 Int              @default(1)
+  isCurrent               Boolean          @default(true) @map("is_current")
+  supersedesId            String?          @map("supersedes_id") @db.Uuid
+  clientSubmissionId      String           @map("client_submission_id") @db.Uuid
+  result                  CompletionResult
+  enteredValuesJson       Json             @default("{}") @map("entered_values_json")
+  measuredNumeric         Decimal?         @map("measured_numeric") @db.Decimal
+  completedBy             String           @map("completed_by") @db.Uuid
+  actorConfirmationMethod String           @default("session") @map("actor_confirmation_method")
+  recordedAt              DateTime         @default(now()) @map("recorded_at") @db.Timestamptz(6)
+  clientReportedAt        DateTime?        @map("client_reported_at") @db.Timestamptz(6)
+  deviceMetaJson          Json?            @map("device_meta_json")
+  editReason              String?          @map("edit_reason")
+  createdAt               DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organization   Organization     @relation(fields: [organizationId], references: [id])
+  taskOccurrence TaskOccurrence   @relation(fields: [taskOccurrenceId], references: [id])
+  supersedes     TaskCompletion?  @relation("TaskCompletionVersion", fields: [supersedesId], references: [id])
+  supersededBy   TaskCompletion[] @relation("TaskCompletionVersion")
+  completedByUser User            @relation("TaskCompletionCompletedBy", fields: [completedBy], references: [id])
+  evidence       Evidence[]
+
+  @@unique([taskOccurrenceId, version])
+  @@unique([organizationId, clientSubmissionId])
+  @@index([organizationId, taskOccurrenceId, version])
+  @@index([organizationId, result, recordedAt])
+  @@map("task_completions")
+}
+
+model Evidence {
+  id               String       @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId   String       @map("organization_id") @db.Uuid
+  taskCompletionId String       @map("task_completion_id") @db.Uuid
+  type             EvidenceType
+  valueText        String?      @map("value_text")
+  valueNumeric     Decimal?     @map("value_numeric") @db.Decimal
+  valueBool        Boolean?     @map("value_bool")
+  // attachment_id: plain nullable UUID, NO FK yet — the attachments table + FK land in M3 #12 (§8.16).
+  attachmentId     String?      @map("attachment_id") @db.Uuid
+  capturedAt       DateTime     @default(now()) @map("captured_at") @db.Timestamptz(6)
+  createdAt        DateTime     @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organization   Organization   @relation(fields: [organizationId], references: [id])
+  taskCompletion TaskCompletion @relation(fields: [taskCompletionId], references: [id])
+
+  @@index([organizationId, taskCompletionId])
+  @@index([organizationId, type])
+  @@map("evidence")
 }
