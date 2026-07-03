@@ -17,9 +17,6 @@ import {
 //  2. The paging loop over an in-memory keyset store: no gaps / no dupes / stability.
 //  3. A real pass over the append-only activity_log through withTenant() (RLS-scoped).
 //  4. A convention guard asserting no OFFSET / Prisma `skip:` leaks into src/ read paths.
-//
-// tsconfig targets ES2017, so bigint LITERALS (1n) are unavailable; build them via BigInt().
-const B = (n: number): bigint => BigInt(n);
 
 const orgAId = inject("orgAId");
 
@@ -57,14 +54,14 @@ describe("cursor codec", () => {
 
 describe("keyset query builders", () => {
   it("single desc key -> field lt cursor", () => {
-    expect(buildKeysetWhere([{ field: "seq", direction: "desc" }], [B(100)])).toEqual({
-      seq: { lt: B(100) },
+    expect(buildKeysetWhere([{ field: "seq", direction: "desc" }], [100n])).toEqual({
+      seq: { lt: 100n },
     });
   });
 
   it("single asc key -> field gt cursor", () => {
-    expect(buildKeysetWhere([{ field: "seq", direction: "asc" }], [B(100)])).toEqual({
-      seq: { gt: B(100) },
+    expect(buildKeysetWhere([{ field: "seq", direction: "asc" }], [100n])).toEqual({
+      seq: { gt: 100n },
     });
   });
 
@@ -95,7 +92,7 @@ describe("keyset query builders", () => {
   });
 
   it("rejects a cursor whose arity does not match the key columns", () => {
-    expect(() => buildKeysetWhere([{ field: "seq" }], [B(1), B(2)])).toThrow();
+    expect(() => buildKeysetWhere([{ field: "seq" }], [1n, 2n])).toThrow();
   });
 });
 
@@ -125,7 +122,7 @@ describe("keysetPaginate — paging loop", () => {
   const keys = [{ field: "seq" as const, direction: "desc" as const }];
 
   it("pages through the full set exactly once: no gaps, no dupes, correct order", async () => {
-    const seqs = Array.from({ length: 25 }, (_, i) => B(i + 1)); // 1..25
+    const seqs = Array.from({ length: 25 }, (_, i) => BigInt(i + 1)); // 1..25
     const fetch = seqStore(seqs);
 
     const seen: bigint[] = [];
@@ -149,40 +146,40 @@ describe("keysetPaginate — paging loop", () => {
     const page = await keysetPaginate({
       keys,
       params: { limit: 10 },
-      fetch: seqStore([B(1), B(2), B(3)]),
+      fetch: seqStore([1n, 2n, 3n]),
     });
-    expect(page.items.map((r) => r.seq)).toEqual([B(3), B(2), B(1)]);
+    expect(page.items.map((r) => r.seq)).toEqual([3n, 2n, 1n]);
     expect(page.nextCursor).toBeNull();
   });
 
   it("reports a nextCursor when the last page is exactly full but more remain", async () => {
     // 6 rows, limit 3: two full pages; the first must still hand back a cursor.
-    const fetch = seqStore([B(1), B(2), B(3), B(4), B(5), B(6)]);
+    const fetch = seqStore([1n, 2n, 3n, 4n, 5n, 6n]);
     const p1 = await keysetPaginate({ keys, params: { limit: 3 }, fetch });
-    expect(p1.items.map((r) => r.seq)).toEqual([B(6), B(5), B(4)]);
+    expect(p1.items.map((r) => r.seq)).toEqual([6n, 5n, 4n]);
     expect(p1.nextCursor).not.toBeNull();
     const p2 = await keysetPaginate({ keys, params: { cursor: p1.nextCursor, limit: 3 }, fetch });
-    expect(p2.items.map((r) => r.seq)).toEqual([B(3), B(2), B(1)]);
+    expect(p2.items.map((r) => r.seq)).toEqual([3n, 2n, 1n]);
     expect(p2.nextCursor).toBeNull();
   });
 
   it("rejects a non-positive or non-integer limit", async () => {
     await expect(
-      keysetPaginate({ keys, params: { limit: 0 }, fetch: seqStore([B(1)]) }),
+      keysetPaginate({ keys, params: { limit: 0 }, fetch: seqStore([1n]) }),
     ).rejects.toThrow();
     await expect(
-      keysetPaginate({ keys, params: { limit: 2.5 }, fetch: seqStore([B(1)]) }),
+      keysetPaginate({ keys, params: { limit: 2.5 }, fetch: seqStore([1n]) }),
     ).rejects.toThrow();
   });
 
   it("concurrent inserts never shift or duplicate an already-read page (the OFFSET bug keyset fixes)", async () => {
     // Start with 10..1, read the first page, then inject rows AHEAD of the cursor.
-    const seqs = Array.from({ length: 10 }, (_, i) => B(10 - i)); // 10..1
+    const seqs = Array.from({ length: 10 }, (_, i) => BigInt(10 - i)); // 10..1
     const page1 = await keysetPaginate({ keys, params: { limit: 3 }, fetch: seqStore(seqs) });
-    expect(page1.items.map((r) => r.seq)).toEqual([B(10), B(9), B(8)]);
+    expect(page1.items.map((r) => r.seq)).toEqual([10n, 9n, 8n]);
 
     // Three new rows arrive (11,12,13) — higher seq, so they land ahead of the cursor.
-    const grown = seqStore([...seqs, B(11), B(12), B(13)]);
+    const grown = seqStore([...seqs, 11n, 12n, 13n]);
     const page2 = await keysetPaginate({
       keys,
       params: { cursor: page1.nextCursor, limit: 3 },
@@ -190,7 +187,7 @@ describe("keysetPaginate — paging loop", () => {
     });
 
     // OFFSET would have re-served [10,9,8] (shifted by the inserts). Keyset seeks past 8.
-    expect(page2.items.map((r) => r.seq)).toEqual([B(7), B(6), B(5)]);
+    expect(page2.items.map((r) => r.seq)).toEqual([7n, 6n, 5n]);
     const p1 = new Set(page1.items.map((r) => String(r.seq)));
     for (const r of page2.items) expect(p1.has(String(r.seq))).toBe(false);
   });
