@@ -14,7 +14,7 @@ _Last updated: 2026-07-03._
 | **M0 — Design sprint** | ✅ complete (QA gate pending) | 49 components, 14 screens, light + dark. #27 in QA (evidence); #24/#25/#26 done — human sign-off closes #1 parent epic. |
 | **M1 — Backend Foundation** | ✅ merged to `main` | Schema + RLS gate + seed + CI + scaffold + Better Auth + Prisma tenant-guard. |
 | **M1 — Neon EU** | 🔴 human-gated | #34 / #3 — credentials needed; Vercel env slots have placeholders. |
-| **M2 — Feature layer** | ⬜ not started | Next milestone: occurrence lifecycle, exceptions, state machines, F2–F5 correctness. |
+| **M2 — Feature layer** | 🟡 in progress | #55 (F5 keyset pagination) first — dependency-corrected order (see below). Occurrence lifecycle, exceptions, state machines, F2–F5 correctness. |
 
 ## What's on `main`
 **Foundation (M1):**
@@ -72,20 +72,22 @@ _Last updated: 2026-07-03._
 | #7 | F1–F8 correctness principles | F6/F7/F8 done; F2–F5 are M2 issues (#52–55) |
 | #34 | Provision Neon EU + pooled connection | 🔴 **human action** — credentials + Vercel env swap |
 
-### M2 — Feature layer (next milestone)
-Correctness foundations first, then occurrence lifecycle:
+### M2 — Feature layer (in progress)
+**Dependency-corrected order** (the original `#52→#53→#54→#55` handoff order was inverted — #52/#53 target `task_completions`, which does not exist yet, and #52 is blocked-by #54). Real chain:
 
-| Issue | Title |
-|---|---|
-| #52 | F2: idempotency keys (`client_submission_id`) on writes |
-| #53 | F3: server-authoritative timestamps (`recorded_at`) |
-| #54 | F4: single state-transition choke point → `activity_log` |
-| #55 | F5: keyset pagination utility + convention |
-| #8 | Occurrence lifecycle enum + generation (Inngest) |
-| #9 | Exception + corrective-action state machines |
-| #10 | Single state-transition choke point → `activity_log` |
-| #11 | Shared-tablet actor identity + correction-version permissions |
-| #69 | Shared-tablet PIN: issuance, storage, verification |
+| Order | Issue | Title | Blocked by |
+|---|---|---|---|
+| 1 | #55 | F5: keyset pagination utility + convention | — (deps met) — **🟡 In Progress** |
+| 2 | #54 | F4: `transition()` mechanism (status write + `activity_log`, atomic) | #56 (done) |
+| 3 | #8 | Occurrence lifecycle enum + generation (Inngest) — **creates `task_completions` etc.** | #54 |
+| 4 | #9 | Exception + corrective-action state machines | #54, #8 |
+| 5 | #53 | F3: server-authoritative timestamps (`recorded_at`) | #8/#9 (task_completions) |
+| 6 | #52 | F2: idempotency keys (`client_submission_id`) on writes | #54, #8/#9 (task_completions) |
+| 7 | #10 | Domain wiring: route transitions through `transition()` (F4 application) | #54, #8, #9 |
+| — | #11 | Shared-tablet actor identity + correction-version permissions | #8/#9 |
+| — | #69 | Shared-tablet PIN: issuance, storage, verification | — |
+
+**#10 vs #54 "duplicate" resolved (not a dup):** #54 = the generic mechanism (backend); #10 = the domain application that consumes it (edge sets, role guards, repeated-deviation rule, F4 assertion test). Neither closed; #10 retitled to remove the identical-title collision, both cross-linked.
 
 ### M3 — Storage, evidence, exports
 #12 R2 + attachments · #13 SHA-256 hash chain · #14 PDF audit pack
@@ -106,4 +108,4 @@ Correctness foundations first, then occurrence lifecycle:
 1. **Neon EU #34** — provision Neon DB (non-superuser `app_user` role), swap Vercel placeholder env values. Human action; unblocks prod deploy.
 2. **Close stale M1 epics** — #2, #4 are done; close them to keep the board clean.
 3. **M0 sign-off** — human review of #24, #25, #26, #27 → close all → close #1.
-4. **M2 start** — pick up #52 (F2 idempotency keys) as the first M2 issue; order: #52→#53→#54→#55→#8→#9.
+4. **M2 in progress** — #55 (F5 keyset pagination) is the first M2 issue (branch `feat/55-keyset-pagination`). Corrected dependency order: #55→#54→#8→#9→#53→#52→#10 (see M2 table above; #52/#53 wait on `task_completions` from #8/#9).
