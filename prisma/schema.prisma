@@ -153,6 +153,7 @@ model User {
 
   memberships     Membership[]
   invitationsSent Invitation[] @relation("InvitedBy")
+  staffPins       StaffPin[]
 
   scheduledTasks  ScheduledTask[]  @relation("ScheduledTaskAssignee")
   taskOccurrences TaskOccurrence[] @relation("TaskOccurrenceAssignee")
@@ -182,6 +183,7 @@ model Organization {
 
   memberships     Membership[]
   invitations     Invitation[]
+  staffPins       StaffPin[]
   properties      Property[]
   outlets         Outlet[]
   activityLogs    ActivityLog[]
@@ -545,4 +547,30 @@ model CorrectiveAction {
   @@index([organizationId, exceptionId])
   @@index([organizationId, assigneeUserId, status])
   @@map("corrective_actions")
+}
+
+// ---- Shared-tablet PIN (#69; D8 §8.8) -------------------------------------------
+// MUTABLE, org-scoped table — one PIN per member per org, set/reset/relocked in place.
+// NOT append-only (has updated_at, no reject trigger). The PIN is stored ONLY as a scrypt
+// hash (pin_hash) — never plaintext, never logged. Issuance/verification/lockout logic lives
+// in src/lib/staff-pin.ts. RLS + FORCE + tenant_isolation applied via raw SQL in the staff_pins
+// migration.
+
+model StaffPin {
+  id             String    @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  userId         String    @map("user_id") @db.Uuid
+  pinHash        String    @map("pin_hash")
+  pinSetAt       DateTime  @default(now()) @map("pin_set_at") @db.Timestamptz(6)
+  failedAttempts Int       @default(0) @map("failed_attempts")
+  lockedUntil    DateTime? @map("locked_until") @db.Timestamptz(6)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  user         User         @relation(fields: [userId], references: [id])
+
+  @@unique([organizationId, userId])
+  @@index([organizationId, userId])
+  @@map("staff_pins")
 }
