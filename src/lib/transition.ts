@@ -1,0 +1,142 @@
+// F4 — the single sanctioned state-transition choke point.
+//
+// Design invariant (§8.20, F4): it must be structurally impossible to change an entity's
+// status/version without writing a matching `activity_log` row. Everything that mutates a
+// status column or creates a versioned edit routes through transition(): it runs the caller's
+// mutation AND writes the audit row in ONE transaction, so the two are all-or-nothing. If the
+// mutation throws, no log row is written; if the log insert throws (e.g. a bad actor FK), the
+// mutation is rolled back too. There is no code path that persists one without the other.
+//
+// SCOPE (issue #54): this ticket delivers the MECHANISM only. The activity_log row is written
+// via the ordinary Prisma insert path (tx.activityLog.create). The tamper-evident hash chain
+// — the per-org dense `seq`, `prev_hash`/`row_hash`, and the SECURITY DEFINER insert function
+// that computes them so application code cannot forge the chain — is deferred to M3 (#13).
+// This module is the seam for that swap: when #13 lands, ONLY logActivity() changes (it will
+// call the SECURITY DEFINER function instead of tx.activityLog.create), and no transition()
+// call site has to change.
+//
+// transition() is deliberately generic over subject_type / the mutation callback: it encodes
+// the atomicity + actor + reason rules, not any one domain's state machine. The occurrence /
+// exception / corrective-action rules (#8/#9/#10) plug in via the `mutate` callback.
+
+import type { TenantClient } from "./db";
+import type { ActivitySubjectType } from "../generated/prisma/enums";
+import type { Prisma } from "../generated/prisma/client";
+
+/**
+ * JSON snapshot stored in before_json / after_json. Uses Prisma's InputJsonValue so the
+ * jsonb columns accept it directly; in practice callers pass a plain object of state fields.
+ */
+export type JsonSnapshot = Prisma.InputJsonValue;
+
+/**
+ * One append-only audit entry. Fields map 1:1 onto the ActivityLog model columns.
+ * Exactly one of `actorUserId` / `actorLabel` identifies the actor (see transition()).
+ */
+export interface ActivityLogEntry {
+  organizationId: string;
+  subjectType: ActivitySubjectType;
+  subjectId: string;
+  action: string;
+  actorUserId?: string;
+  actorLabel?: string;
+  beforeJson?: JsonSnapshot;
+  afterJson?: JsonSnapshot;
+  reason?: string;
+}
+
+/**
+ * Insert one activity_log row inside the caller's transaction.
+ *
+ * This is the single write path for the audit log — the seam that M3 (#13) will swap for the
+ * SECURITY DEFINER hash-chain function. Do NOT insert into activity_log from anywhere else.
+ */
+export function logActivity(tx: TenantClient, entry: ActivityLogEntry): Promise<{ id: string }> {
+  return tx.activityLog.create({
+    data: {
+      organizationId: entry.organizationId,
+      subjectType: entry.subjectType,
+      subjectId: entry.subjectId,
+      action: entry.action,
+      actorUserId: entry.actorUserId ?? null,
+      actorLabel: entry.actorLabel ?? null,
+      beforeJson: entry.beforeJson ?? undefined,
+      afterJson: entry.afterJson ?? undefined,
+      reason: entry.reason ?? null,
+    },
+    select: { id: true },
+  });
+}
+
+/** Options for a single transition. See transition() for the ordering guarantees. */
+export interface TransitionOptions<T> {
+  organizationId: string;
+  subjectType: ActivitySubjectType;
+  subjectId: string;
+  action: string;
+  /** User actor. Set this XOR `actorLabel` — exactly one. */
+  actorUserId?: string;
+  /** System actor label, e.g. 'system:overdue-sweep'. Set this XOR `actorUserId`. */
+  actorLabel?: string;
+  /** Prior state snapshot (mapped to before_json). */
+  before?: JsonSnapshot;
+  /** New state snapshot (mapped to after_json). */
+  after?: JsonSnapshot;
+  /** Free-text reason (required for compliance edits — see requireReason). */
+  reason?: string;
+  /**
+   * When true, `reason` must be a non-empty (non-whitespace) string or transition() throws
+   * BEFORE any write. #54 only enforces the flag; each domain decides when to set it.
+   */
+  requireReason?: boolean;
+  /** The status/version mutation. Runs inside the same `tx` as the audit insert. */
+  mutate: (tx: TenantClient) => Promise<T>;
+}
+
+function isBlank(value: string | undefined): boolean {
+  return value === undefined || value.trim().length === 0;
+}
+
+/**
+ * Perform a state transition atomically: run the caller's mutation and write the audit row in
+ * the SAME transaction. Runs inside a caller-provided `tx` (from withTenant), so it inherits
+ * the tenant RLS context and shares the mutation's atomicity.
+ *
+ * Order of operations:
+ *   1. Validate the actor (exactly one of actorUserId / actorLabel) and, if requireReason,
+ *      the reason — BEFORE any write, so a bad call cannot mutate anything.
+ *   2. Run `mutate(tx)` and capture its result.
+ *   3. Write the activity_log row (before -> before_json, after -> after_json).
+ *   4. Return the mutation's result.
+ *
+ * Any throw in step 2, 3, or the caller's surrounding transaction rolls back BOTH the mutation
+ * and the audit insert — they can never diverge.
+ */
+export async function transition<T>(tx: TenantClient, opts: TransitionOptions<T>): Promise<T> {
+  const hasUser = opts.actorUserId !== undefined;
+  const hasLabel = opts.actorLabel !== undefined;
+  if (hasUser === hasLabel) {
+    throw new Error(
+      "transition(): exactly one of actorUserId (user actor) or actorLabel (system actor) must be set",
+    );
+  }
+  if (opts.requireReason && isBlank(opts.reason)) {
+    throw new Error(`transition(): action '${opts.action}' requires a non-empty reason`);
+  }
+
+  const result = await opts.mutate(tx);
+
+  await logActivity(tx, {
+    organizationId: opts.organizationId,
+    subjectType: opts.subjectType,
+    subjectId: opts.subjectId,
+    action: opts.action,
+    actorUserId: opts.actorUserId,
+    actorLabel: opts.actorLabel,
+    beforeJson: opts.before,
+    afterJson: opts.after,
+    reason: opts.reason,
+  });
+
+  return result;
+}
