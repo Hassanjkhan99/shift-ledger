@@ -95,6 +95,29 @@ enum OccurrenceStatus {
   @@map("occurrence_status")
 }
 
+// Exception lifecycle (D2, §7.2). Terminal-happy: verified. reopened re-enters via acknowledged.
+enum ExceptionStatus {
+  open
+  acknowledged
+  in_progress
+  resolved
+  verified
+  reopened
+
+  @@map("exception_status")
+}
+
+// CorrectiveAction lifecycle (D2, §7.3). Terminal-happy: verified. rejected routes back to assigned.
+enum CorrectiveStatus {
+  open
+  assigned
+  done
+  verified
+  rejected
+
+  @@map("corrective_status")
+}
+
 enum ActivitySubjectType {
   organization
   property
@@ -135,6 +158,11 @@ model User {
   taskOccurrences TaskOccurrence[] @relation("TaskOccurrenceAssignee")
   taskCompletions TaskCompletion[] @relation("TaskCompletionCompletedBy")
 
+  exceptionsOpened            Exception[]        @relation("ExceptionOpenedBy")
+  correctiveActionsAssigned   CorrectiveAction[] @relation("CorrectiveActionAssignee")
+  correctiveActionsCompleted  CorrectiveAction[] @relation("CorrectiveActionCompletedBy")
+  correctiveActionsVerified   CorrectiveAction[] @relation("CorrectiveActionVerifiedBy")
+
   @@map("users")
 }
 
@@ -162,6 +190,8 @@ model Organization {
   taskOccurrences TaskOccurrence[]
   taskCompletions TaskCompletion[]
   evidence        Evidence[]
+  exceptions       Exception[]
+  correctiveActions CorrectiveAction[]
 
   @@map("organizations")
 }
@@ -226,6 +256,7 @@ model Property {
   outlets         Outlet[]
   scheduledTasks  ScheduledTask[]
   taskOccurrences TaskOccurrence[]
+  exceptions      Exception[]
 
   @@unique([organizationId, name])
   @@index([organizationId, deletedAt])
@@ -245,6 +276,7 @@ model Outlet {
   property        Property         @relation(fields: [propertyId], references: [id])
   scheduledTasks  ScheduledTask[]
   taskOccurrences TaskOccurrence[]
+  exceptions      Exception[]
 
   @@unique([propertyId, name])
   @@index([organizationId, propertyId, deletedAt])
@@ -367,6 +399,7 @@ model TaskOccurrence {
   taskTemplate  TaskTemplate  @relation(fields: [taskTemplateId], references: [id])
   assigneeUser  User?         @relation("TaskOccurrenceAssignee", fields: [assigneeUserId], references: [id])
   completions   TaskCompletion[]
+  exceptions    Exception[]
 
   @@unique([scheduledTaskId, occurrenceLocalDate])
   @@index([organizationId, propertyId, outletId, occurrenceLocalDate, status])
@@ -417,6 +450,7 @@ model TaskCompletion {
   supersededBy   TaskCompletion[] @relation("TaskCompletionVersion")
   completedByUser User            @relation("TaskCompletionCompletedBy", fields: [completedBy], references: [id])
   evidence       Evidence[]
+  exceptions     Exception[]
 
   @@unique([taskOccurrenceId, version])
   @@unique([organizationId, clientSubmissionId])
@@ -444,4 +478,71 @@ model Evidence {
   @@index([organizationId, taskCompletionId])
   @@index([organizationId, type])
   @@map("evidence")
+}
+
+// ---- Exceptions + corrective actions (#9; §8.17 exceptions, §8.18 corrective_actions) -----------
+// Mutable tenant-scoped tables (soft-delete via deleted_at, have updated_at). RLS + FORCE +
+// tenant_isolation applied via raw SQL in the exceptions_corrective migration. NOT append-only
+// (no reject trigger). The D2 state machines (§7.2/§7.3) live in src/lib/exceptions.ts and route
+// every status change through the F4 transition() choke point.
+
+model Exception {
+  id               String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId   String          @map("organization_id") @db.Uuid
+  propertyId       String          @map("property_id") @db.Uuid
+  outletId         String          @map("outlet_id") @db.Uuid
+  taskOccurrenceId String          @map("task_occurrence_id") @db.Uuid
+  taskCompletionId String?         @map("task_completion_id") @db.Uuid
+  status           ExceptionStatus @default(open)
+  severity         String          @default("normal")
+  title            String
+  detail           String?
+  openedBy         String?         @map("opened_by") @db.Uuid
+  openedAt         DateTime        @default(now()) @map("opened_at") @db.Timestamptz(6)
+  resolvedAt       DateTime?       @map("resolved_at") @db.Timestamptz(6)
+  createdAt        DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt        DateTime?       @map("deleted_at") @db.Timestamptz(6)
+
+  organization   Organization    @relation(fields: [organizationId], references: [id])
+  property       Property        @relation(fields: [propertyId], references: [id])
+  outlet         Outlet          @relation(fields: [outletId], references: [id])
+  taskOccurrence TaskOccurrence  @relation(fields: [taskOccurrenceId], references: [id])
+  taskCompletion TaskCompletion? @relation(fields: [taskCompletionId], references: [id])
+  openedByUser   User?           @relation("ExceptionOpenedBy", fields: [openedBy], references: [id])
+  correctiveActions CorrectiveAction[]
+
+  @@index([organizationId, status, openedAt])
+  @@index([organizationId, outletId, status])
+  @@index([organizationId, taskOccurrenceId])
+  @@map("exceptions")
+}
+
+model CorrectiveAction {
+  id             String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  exceptionId    String           @map("exception_id") @db.Uuid
+  status         CorrectiveStatus @default(open)
+  description    String
+  assigneeUserId String?          @map("assignee_user_id") @db.Uuid
+  assigneeRole   OrgRole?         @map("assignee_role")
+  dueAt          DateTime?        @map("due_at") @db.Timestamptz(6)
+  completedBy    String?          @map("completed_by") @db.Uuid
+  completedAt    DateTime?        @map("completed_at") @db.Timestamptz(6)
+  verifiedBy     String?          @map("verified_by") @db.Uuid
+  verifiedAt     DateTime?        @map("verified_at") @db.Timestamptz(6)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime?        @map("deleted_at") @db.Timestamptz(6)
+
+  organization  Organization @relation(fields: [organizationId], references: [id])
+  exception     Exception    @relation(fields: [exceptionId], references: [id])
+  assigneeUser  User?        @relation("CorrectiveActionAssignee", fields: [assigneeUserId], references: [id])
+  completedByUser User?      @relation("CorrectiveActionCompletedBy", fields: [completedBy], references: [id])
+  verifiedByUser  User?      @relation("CorrectiveActionVerifiedBy", fields: [verifiedBy], references: [id])
+
+  @@index([organizationId, status, dueAt])
+  @@index([organizationId, exceptionId])
+  @@index([organizationId, assigneeUserId, status])
+  @@map("corrective_actions")
 }
