@@ -435,6 +435,9 @@ model TaskCompletion {
   enteredValuesJson       Json             @default("{}") @map("entered_values_json")
   measuredNumeric         Decimal?         @map("measured_numeric") @db.Decimal
   completedBy             String           @map("completed_by") @db.Uuid
+  /// Shared-tablet actor identity (D8). Domain: 'session' | 'pin' | 'initials'. Prisma cannot
+  /// express the CHECK, so it is enforced by task_completions_actor_confirmation_method_check in
+  /// migration 20260703170000_actor_method_check (mirrored by assertValidConfirmationMethod).
   actorConfirmationMethod String           @default("session") @map("actor_confirmation_method")
   /// F3 compliance timestamp. Server-authoritative: a BEFORE INSERT trigger unconditionally overwrites
   /// any supplied value with clock_timestamp() (real wall-clock, not tx-start now()), so the client can
