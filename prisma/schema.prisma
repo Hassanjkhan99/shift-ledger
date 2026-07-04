@@ -358,7 +358,10 @@ model TaskOccurrence {
 
   @@unique([scheduledTaskId, occurrenceLocalDate])
   @@index([organizationId, propertyId, outletId, occurrenceLocalDate, status])
-  @@index([status, dueAt])
+  // The overdue-sweep index is PARTIAL — (status, due_at) WHERE status IN ('pending','due') —
+  // and lives only in the occurrence_domain migration (Prisma cannot express a partial index).
+  // Do NOT add a full @@index([status, dueAt]) here: it would be a second, unbounded index and
+  // would make `prisma migrate diff` report drift against the intentional partial index.
   @@index([organizationId, assigneeUserId, occurrenceLocalDate])
   @@index([organizationId, status, occurrenceLocalDate])
   @@map("task_occurrences")

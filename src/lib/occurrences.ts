@@ -110,6 +110,34 @@ export function computeDueAt(localDate: Date, timeOfDay: string, timezone: strin
   return dt.toJSDate();
 }
 
+/**
+ * Read the wall-clock "HH:mm" from the dedicated `time_of_day` column. Prisma maps a `@db.Time`
+ * to a JS Date whose UTC time-of-day carries HH:mm:ss (the date part is the 1970 epoch). This
+ * column is separately editable, so generation honors a time-only edit here even if it diverges
+ * from recurrence_json.timeOfDay (which still drives the firing-day logic).
+ */
+export function timeOfDayHHmm(timeOfDay: Date): string {
+  const hh = String(timeOfDay.getUTCHours()).padStart(2, "0");
+  const mm = String(timeOfDay.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+/**
+ * Interpret a date-only `@db.Date` value (which Prisma returns as UTC midnight) as the start of
+ * that same calendar day in `timezone`. Uses the UTC Y/M/D fields so the calendar day is preserved
+ * regardless of the zone's distance from UTC — unlike fromJSDate, which would shift it west of UTC.
+ */
+function dateOnlyToLocal(dateOnly: Date, timezone: string): DateTime {
+  return DateTime.fromObject(
+    {
+      year: dateOnly.getUTCFullYear(),
+      month: dateOnly.getUTCMonth() + 1,
+      day: dateOnly.getUTCDate(),
+    },
+    { zone: timezone },
+  ).startOf("day");
+}
+
 /** The three local dates in the rolling window [today_local, today_local + 2] (§9.2). */
 function windowLocalDates(now: Date, timezone: string): DateTime[] {
   const today = DateTime.fromJSDate(now, { zone: timezone }).startOf("day");
@@ -138,7 +166,11 @@ function recurrenceFiresOn(rec: Recurrence, startsOn: DateTime, candidate: DateT
       const months = (candidate.year - startsOn.year) * 12 + (candidate.month - startsOn.month);
       if (months % rec.interval !== 0) return false;
       const monthDays = rec.byMonthDay ?? [startsOn.day];
-      return monthDays.includes(candidate.day);
+      // Clamp each requested month-day to the last valid day of the candidate month, so a
+      // schedule on day 31 (explicit byMonthDay or a starts_on on the 31st) still fires in short
+      // months — Feb 28/29, Apr 30, etc. — instead of silently never firing.
+      const daysInMonth = candidate.daysInMonth ?? 31;
+      return monthDays.some((d) => Math.min(d, daysInMonth) === candidate.day);
     }
     default:
       return false;
@@ -166,7 +198,15 @@ export async function generateOccurrences(
   { organizationId, now }: GenerateArgs,
 ): Promise<GenerateResult> {
   const schedules = await tx.scheduledTask.findMany({
-    where: { organizationId, isActive: true, deletedAt: null },
+    where: {
+      organizationId,
+      isActive: true,
+      deletedAt: null,
+      // Skip schedules whose parent site was soft-archived — no new occurrences for a
+      // tombstoned outlet or property, even if the schedule row itself is still active.
+      outlet: { deletedAt: null },
+      property: { deletedAt: null },
+    },
     // check_type is snapshot from the template onto each occurrence (§8.13, denormalized).
     include: { taskTemplate: { select: { checkType: true } } },
   });
@@ -176,11 +216,16 @@ export async function generateOccurrences(
   for (const schedule of schedules) {
     const rec = parseRecurrence(schedule.recurrenceJson);
     const tz = schedule.timezone;
-    const startsOn = DateTime.fromJSDate(schedule.startsOn, { zone: tz }).startOf("day");
-    const endsOn = schedule.endsOn
-      ? DateTime.fromJSDate(schedule.endsOn, { zone: tz }).startOf("day")
-      : null;
+    // starts_on / ends_on are pure @db.Date values — Prisma hands them back as UTC midnight.
+    // fromJSDate(..., {zone: tz}) would reinterpret that instant in the local zone and, for
+    // zones west of UTC, shift it to the PREVIOUS calendar day (generation could start a day
+    // early / end a day late). Build the DateTime from the UTC Y/M/D fields instead, matching
+    // how occurrence_local_date is anchored below.
+    const startsOn = dateOnlyToLocal(schedule.startsOn, tz);
+    const endsOn = schedule.endsOn ? dateOnlyToLocal(schedule.endsOn, tz) : null;
     const checkType: CheckType = schedule.taskTemplate.checkType;
+    // Wall-clock comes from the dedicated, editable time_of_day column (not recurrence_json).
+    const timeOfDay = timeOfDayHHmm(schedule.timeOfDay);
 
     for (const candidate of windowLocalDates(now, tz)) {
       if (endsOn && candidate > endsOn) continue;
@@ -189,7 +234,7 @@ export async function generateOccurrences(
       // occurrence_local_date is a pure DATE — anchor it at UTC midnight so Prisma's @db.Date maps
       // the intended calendar day regardless of the runner's local zone.
       const localDate = new Date(Date.UTC(candidate.year, candidate.month - 1, candidate.day));
-      const dueAt = computeDueAt(localDate, rec.timeOfDay, tz);
+      const dueAt = computeDueAt(localDate, timeOfDay, tz);
 
       // Idempotent create-if-absent. Prisma's createMany with skipDuplicates maps to
       // INSERT ... ON CONFLICT DO NOTHING; count===0 means the row already existed (never reset it).
@@ -266,13 +311,16 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
   let becameDue = 0;
   let becameOverdue = 0;
 
-  // pending → due: due_at reached.
+  // pending → due: due_at reached. Exclude tombstoned rows (deleted_at not null).
   const toDue = await tx.taskOccurrence.findMany({
-    where: { status: "pending", dueAt: { lte: now } },
+    where: { status: "pending", dueAt: { lte: now }, deletedAt: null },
     select: { id: true, organizationId: true, dueAt: true },
   });
   for (const occ of toDue) {
-    await transition(tx, {
+    // Compare-and-set: only flip the row if it is STILL pending. If a completion/skip/cancel
+    // committed between the read above and this write, the updateMany matches 0 rows and the
+    // sweep must not clobber that terminal state or log a phantom transition.
+    const res = await transition(tx, {
       organizationId: occ.organizationId,
       subjectType: "taskOccurrence",
       subjectId: occ.id,
@@ -280,14 +328,20 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
       actorLabel: "system:overdue-sweep",
       before: { status: "pending" },
       after: { status: "due" },
-      mutate: (t) => t.taskOccurrence.update({ where: { id: occ.id }, data: { status: "due" } }),
+      mutate: (t) =>
+        t.taskOccurrence.updateMany({
+          where: { id: occ.id, status: "pending" },
+          data: { status: "due" },
+        }),
+      didMutate: (r) => r.count === 1,
     });
-    becameDue += 1;
+    if (res.count === 1) becameDue += 1;
   }
 
   // due → overdue: grace elapsed. grace_minutes lives on the parent scheduled_task, so join it.
+  // Exclude tombstoned rows (deleted_at not null).
   const dueOccurrences = await tx.taskOccurrence.findMany({
-    where: { status: "due" },
+    where: { status: "due", deletedAt: null },
     select: {
       id: true,
       organizationId: true,
@@ -298,7 +352,8 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
   for (const occ of dueOccurrences) {
     const graceMs = occ.scheduledTask.graceMinutes * 60_000;
     if (now.getTime() <= occ.dueAt.getTime() + graceMs) continue;
-    await transition(tx, {
+    // Compare-and-set on the still-`due` status (same concurrency guard as pending→due).
+    const res = await transition(tx, {
       organizationId: occ.organizationId,
       subjectType: "taskOccurrence",
       subjectId: occ.id,
@@ -307,9 +362,13 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
       before: { status: "due" },
       after: { status: "overdue" },
       mutate: (t) =>
-        t.taskOccurrence.update({ where: { id: occ.id }, data: { status: "overdue" } }),
+        t.taskOccurrence.updateMany({
+          where: { id: occ.id, status: "due" },
+          data: { status: "overdue" },
+        }),
+      didMutate: (r) => r.count === 1,
     });
-    becameOverdue += 1;
+    if (res.count === 1) becameOverdue += 1;
   }
 
   return { becameDue, becameOverdue };

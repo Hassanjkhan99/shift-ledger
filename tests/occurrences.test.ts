@@ -49,7 +49,14 @@ async function makeSchedule(
   orgId: string,
   fx: Fixture,
   rec: Recurrence,
-  opts: { timezone: string; startsOn: Date; endsOn?: Date; graceMinutes?: number },
+  opts: {
+    timezone: string;
+    startsOn: Date;
+    endsOn?: Date;
+    graceMinutes?: number;
+    // Override the time_of_day column (HH:mm) independently of recurrence_json.timeOfDay.
+    timeOfDayColumn?: string;
+  },
 ): Promise<string> {
   return withTenant(orgId, async (tx) => {
     const st = await tx.scheduledTask.create({
@@ -61,7 +68,7 @@ async function makeSchedule(
         recurrenceJson: rec,
         recurrenceFreq: rec.freq,
         // time_of_day is a @db.Time — a Date whose UTC time-of-day carries HH:mm:ss.
-        timeOfDay: new Date(`1970-01-01T${rec.timeOfDay}:00Z`),
+        timeOfDay: new Date(`1970-01-01T${opts.timeOfDayColumn ?? rec.timeOfDay}:00Z`),
         timezone: opts.timezone,
         assigneeRole: "KitchenManager",
         graceMinutes: opts.graceMinutes ?? 15,
@@ -393,6 +400,219 @@ describe("sweepOccurrences", () => {
     expect(logs).toHaveLength(2);
     const actions = logs.map((l) => l.action).sort();
     expect(actions).toEqual(["occurrence.due", "occurrence.overdue"]);
+  });
+});
+
+// ---- Monthly byMonthDay clamping (reviewer fix #1) ------------------------------
+describe("generateOccurrences — monthly byMonthDay clamps to last day of short months", () => {
+  it("byMonthDay:[31] fires on Feb 28 (2026 is not a leap year)", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Monthly day-31 clamp");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "monthly", interval: 1, byMonthDay: [31], timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+    // Window Feb 26/27/28 2026. Day 31 clamps to Feb 28 (last day) → exactly one occurrence.
+    const now = new Date("2026-02-26T08:00:00Z");
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({ where: { scheduledTaskId: st } }),
+    );
+    expect(occ).toHaveLength(1);
+    // occurrence_local_date is the 28th (UTC-anchored @db.Date).
+    expect(DateTime.fromJSDate(occ[0].occurrenceLocalDate, { zone: "utc" }).day).toBe(28);
+    expect(DateTime.fromJSDate(occ[0].occurrenceLocalDate, { zone: "utc" }).month).toBe(2);
+  });
+});
+
+// ---- Date-only starts_on/ends_on across time zones (reviewer fix #2) ------------
+describe("generateOccurrences — date-only starts_on/ends_on preserved west of UTC", () => {
+  it("starts_on is honored as the intended calendar day in America/New_York (no day-early shift)", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "NY starts_on boundary");
+    // starts_on = 2026-05-11. In America/New_York (UTC-4 in May) a naive fromJSDate of UTC
+    // midnight would land on 2026-05-10, incorrectly letting the 10th fire. It must not.
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "09:00" },
+      { timezone: "America/New_York", startsOn: new Date(Date.UTC(2026, 4, 11)) },
+    );
+    // Window = May 10, 11, 12 (today_local = 2026-05-10). Only 11 and 12 are on/after starts_on.
+    const now = new Date("2026-05-10T14:00:00Z"); // 10:00 local NY on the 10th
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({
+        where: { scheduledTaskId: st },
+        orderBy: { occurrenceLocalDate: "asc" },
+      }),
+    );
+    // The 10th must be excluded (before starts_on); only the 11th and 12th generate.
+    const days = occ.map((o) => DateTime.fromJSDate(o.occurrenceLocalDate, { zone: "utc" }).day);
+    expect(days).toEqual([11, 12]);
+    // 09:00 local NY (EDT, UTC-4) on the 11th == 13:00Z.
+    expect(occ[0].dueAt.toISOString()).toBe("2026-05-11T13:00:00.000Z");
+  });
+
+  it("ends_on is honored as the intended calendar day in America/New_York (no day-late shift)", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "NY ends_on boundary");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "09:00" },
+      {
+        timezone: "America/New_York",
+        startsOn: new Date(Date.UTC(2026, 0, 1)),
+        endsOn: new Date(Date.UTC(2026, 4, 11)), // last valid day = May 11
+      },
+    );
+    // Window = May 11, 12, 13. Only the 11th is <= ends_on; 12 & 13 excluded.
+    const now = new Date("2026-05-11T14:00:00Z");
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({ where: { scheduledTaskId: st } }),
+    );
+    expect(occ).toHaveLength(1);
+    expect(DateTime.fromJSDate(occ[0].occurrenceLocalDate, { zone: "utc" }).day).toBe(11);
+  });
+});
+
+// ---- due_at follows the time_of_day column (reviewer fix #3) --------------------
+describe("generateOccurrences — due_at reads the editable time_of_day column, not recurrence_json", () => {
+  it("a time_of_day edit diverging from recurrence_json.timeOfDay drives due_at", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "time_of_day column wins");
+    // recurrence_json says 06:00 but the column says 14:30 — the column must win.
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      {
+        timezone: "Europe/Berlin",
+        startsOn: new Date(Date.UTC(2026, 0, 1)),
+        timeOfDayColumn: "14:30",
+      },
+    );
+    const now = new Date("2026-07-20T03:00:00Z");
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({
+        where: { scheduledTaskId: st },
+        orderBy: { occurrenceLocalDate: "asc" },
+      }),
+    );
+    expect(occ).toHaveLength(3);
+    // 14:30 local Berlin summer (CEST, UTC+2) == 12:30Z — NOT 04:00Z (which 06:00 would give).
+    expect(occ[0].dueAt.toISOString()).toBe("2026-07-20T12:30:00.000Z");
+  });
+});
+
+// ---- Soft-archived sites stop generation (reviewer fix #4) ----------------------
+describe("generateOccurrences — skips schedules whose parent site is soft-archived", () => {
+  it("archiving the outlet stops new occurrence generation", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Archived-outlet skip");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+    const now = new Date("2026-07-25T03:00:00Z");
+
+    // Soft-archive the outlet BEFORE the first generation run.
+    await withTenant(orgAId, (tx) =>
+      tx.outlet.update({ where: { id: siteA.outletId }, data: { deletedAt: new Date() } }),
+    );
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.count({ where: { scheduledTaskId: st } }),
+    );
+    expect(occ).toBe(0); // outlet archived → nothing generated
+
+    // Un-archive to avoid leaking a soft-deleted seeded outlet into later shared-org tests.
+    await withTenant(orgAId, (tx) =>
+      tx.outlet.update({ where: { id: siteA.outletId }, data: { deletedAt: null } }),
+    );
+  });
+});
+
+// ---- Sweep concurrency safety (reviewer fix #5) ---------------------------------
+describe("sweepOccurrences — compare-and-set + tombstone safety", () => {
+  it("does not clobber an occurrence that was completed between the sweep read and write", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Sweep CAS check");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)), graceMinutes: 15 },
+    );
+    const base = {
+      organizationId: orgAId,
+      propertyId: siteA.propertyId,
+      outletId: siteA.outletId,
+      scheduledTaskId: st,
+      taskTemplateId: tpl,
+      checkType: "temperature" as const,
+      timezone: "Europe/Berlin",
+    };
+
+    // A pending row that is already completed in the DB but whose STATUS the sweep will try to
+    // flip via CAS. We simulate the race by pre-setting it to `completed` while its due_at is in
+    // the past — the sweep's WHERE {status:'pending'} must match 0 rows and leave it completed.
+    const raced = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.create({
+        data: {
+          ...base,
+          occurrenceLocalDate: new Date(Date.UTC(2026, 10, 2)),
+          dueAt: new Date("2026-11-02T08:00:00Z"),
+          status: "completed",
+          completedAt: new Date("2026-11-02T07:30:00Z"),
+        },
+        select: { id: true },
+      }),
+    );
+
+    // A tombstoned (soft-deleted) pending row past due_at — must NOT be swept to due.
+    const tombstoned = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.create({
+        data: {
+          ...base,
+          occurrenceLocalDate: new Date(Date.UTC(2026, 10, 3)),
+          dueAt: new Date("2026-11-02T08:00:00Z"),
+          status: "pending",
+          deletedAt: new Date("2026-11-02T07:00:00Z"),
+        },
+        select: { id: true },
+      }),
+    );
+
+    const now = new Date("2026-11-02T09:00:00Z"); // past due_at + grace
+    await withTenant(orgAId, (tx) => sweepOccurrences(tx, { now }));
+
+    const after = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({
+        where: { id: { in: [raced.id, tombstoned.id] } },
+      }),
+    );
+    const byId = new Map(after.map((o) => [o.id, o.status]));
+    expect(byId.get(raced.id)).toBe("completed"); // CAS no-op → not clobbered
+    expect(byId.get(tombstoned.id)).toBe("pending"); // deleted_at → excluded from sweep
+
+    // No sweep transition log was emitted for the raced/tombstoned rows.
+    const logs = await withTenant(orgAId, (tx) =>
+      tx.activityLog.findMany({
+        where: {
+          actorLabel: "system:overdue-sweep",
+          subjectId: { in: [raced.id, tombstoned.id] },
+        },
+      }),
+    );
+    expect(logs).toHaveLength(0);
   });
 });
 
