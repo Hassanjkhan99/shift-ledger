@@ -66,11 +66,25 @@ function tag(value: CursorValue): TaggedValue {
   return value;
 }
 
-function untag(value: TaggedValue): CursorValue {
-  if (value !== null && typeof value === "object" && "__t" in value) {
-    return value.__t === "bigint" ? BigInt(value.v) : new Date(value.v);
+// Decode one cursor element back to a scalar. Strict by construction: a cursor is attacker-
+// controllable, so anything that is not a plain scalar or a well-formed tagged bigint/date is
+// rejected here rather than flowing into a Prisma predicate as `{ lt: {} }` or an `Invalid Date`
+// (which would turn a bad cursor into a 500 instead of a clean validation failure).
+function untag(value: unknown): CursorValue {
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
   }
-  return value;
+  if (value !== null && typeof value === "object" && "__t" in value) {
+    const tagged = value as { __t: unknown; v: unknown };
+    if (tagged.__t === "bigint" && typeof tagged.v === "string" && /^-?\d+$/.test(tagged.v)) {
+      return BigInt(tagged.v);
+    }
+    if (tagged.__t === "date" && typeof tagged.v === "string") {
+      const d = new Date(tagged.v);
+      if (!Number.isNaN(d.getTime())) return d;
+    }
+  }
+  throw new Error("Invalid keyset cursor");
 }
 
 /** Encode the sort-key values of the last row on a page into an opaque cursor string. */
@@ -80,7 +94,7 @@ export function encodeCursor(values: CursorValue[]): string {
 
 /** Decode an opaque cursor back into its sort-key values. Throws on a malformed cursor. */
 export function decodeCursor(cursor: string): CursorValue[] {
-  const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as TaggedValue[];
+  const parsed: unknown = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
   if (!Array.isArray(parsed)) throw new Error("Invalid keyset cursor");
   return parsed.map(untag);
 }

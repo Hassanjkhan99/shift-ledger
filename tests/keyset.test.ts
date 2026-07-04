@@ -53,6 +53,15 @@ describe("cursor codec", () => {
   it("throws on a malformed cursor", () => {
     expect(() => decodeCursor("!!! not base64url json")).toThrow();
   });
+
+  it("rejects a well-formed-JSON cursor that is not a tagged scalar (no {lt:{}} into Prisma)", () => {
+    const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString("base64url");
+    expect(() => decodeCursor(b64([{}]))).toThrow(); // bare object element
+    expect(() => decodeCursor(b64([[1, 2]]))).toThrow(); // nested array element
+    expect(() => decodeCursor(b64([null]))).toThrow(); // null element
+    expect(() => decodeCursor(b64([{ __t: "date", v: "not-a-date" }]))).toThrow(); // invalid tagged date
+    expect(() => decodeCursor(b64([{ __t: "bigint", v: "12x" }]))).toThrow(); // invalid tagged bigint
+  });
 });
 
 describe("keyset query builders", () => {
