@@ -139,6 +139,7 @@ async function exceptionEdge(
     select: { status: true, organizationId: true },
   });
   assertFrom("exception", edge, current.status, EXCEPTION_FROM[edge]);
+  const expectedFrom = current.status;
 
   return transition(tx, {
     organizationId: current.organizationId,
@@ -150,12 +151,22 @@ async function exceptionEdge(
     before: { status: current.status },
     after: { status: to },
     reason: actor.reason,
-    mutate: (t) =>
-      t.exception.update({
-        where: { id: exceptionId },
+    // Compare-and-set: only flip if the row is still in the status we read (expectedFrom). A
+    // concurrent legal edge from the same state loses the race — count !== 1 — and we THROW so the
+    // whole transition rolls back (no status change, no audit row). Unlike the sweep's silent
+    // no-op, a user-driven edge that loses the race must fail loudly.
+    mutate: async (t) => {
+      const res = await t.exception.updateMany({
+        where: { id: exceptionId, status: expectedFrom },
         data: { status: to, ...extraData },
-        select: { id: true, status: true },
-      }),
+      });
+      if (res.count !== 1) {
+        throw new Error(
+          `exception: concurrent modification — '${edge}' expected status '${expectedFrom}' but the row changed underneath`,
+        );
+      }
+      return { id: exceptionId, status: to };
+    },
   });
 }
 
@@ -208,7 +219,11 @@ export function verifyException(tx: TenantClient, exceptionId: string, actor: Ac
   );
 }
 
-/** resolved → reopened AND verified → reopened. */
+/**
+ * resolved → reopened AND verified → reopened. Clears resolved_at: a reopened exception is active
+ * again, so a stale resolved_at would misrepresent it as still resolved. The prior value survives
+ * in the audit log's before_json.
+ */
 export function reopenException(tx: TenantClient, exceptionId: string, actor: Actor) {
   return exceptionEdge(
     tx,
@@ -217,6 +232,7 @@ export function reopenException(tx: TenantClient, exceptionId: string, actor: Ac
     ExceptionStatus.reopened,
     "exception.reopened",
     actor,
+    { resolvedAt: null },
   );
 }
 
@@ -286,6 +302,7 @@ async function correctiveEdge(
     select: { status: true, exceptionId: true, organizationId: true },
   });
   assertFrom("correctiveAction", edge, current.status, CORRECTIVE_FROM[edge]);
+  const expectedFrom = current.status;
 
   const updated = await transition(tx, {
     organizationId: current.organizationId,
@@ -297,12 +314,22 @@ async function correctiveEdge(
     before: { status: current.status },
     after: { status: to },
     reason: actor.reason,
-    mutate: (t) =>
-      t.correctiveAction.update({
-        where: { id: correctiveActionId },
+    // Compare-and-set: only flip if the row is still in the status we read (expectedFrom). A
+    // concurrent legal edge from the same state loses the race — count !== 1 — and we THROW so the
+    // whole transition rolls back (no status change, no audit row). Unlike the sweep's silent
+    // no-op, a user-driven edge that loses the race must fail loudly.
+    mutate: async (t) => {
+      const res = await t.correctiveAction.updateMany({
+        where: { id: correctiveActionId, status: expectedFrom },
         data: { status: to, ...extraData },
-        select: { id: true, status: true },
-      }),
+      });
+      if (res.count !== 1) {
+        throw new Error(
+          `correctiveAction: concurrent modification — '${edge}' expected status '${expectedFrom}' but the row changed underneath`,
+        );
+      }
+      return { id: correctiveActionId, status: to };
+    },
   });
   return { ...updated, exceptionId: current.exceptionId, organizationId: current.organizationId };
 }
@@ -324,6 +351,16 @@ export async function assignCorrectiveAction(
   input: AssignCorrectiveActionInput,
   actor: Actor,
 ): Promise<{ id: string; status: CorrectiveStatus }> {
+  // Exactly one assignee target: a CA must be assigned to a specific user XOR a role, never both
+  // and never neither (an unassigned "assigned" CA has no owner). Checked before any write.
+  const hasUser = input.assigneeUserId !== undefined && input.assigneeUserId !== null;
+  const hasRole = input.assigneeRole !== undefined && input.assigneeRole !== null;
+  if (hasUser === hasRole) {
+    throw new Error(
+      "assignCorrectiveAction: exactly one of assigneeUserId or assigneeRole must be provided",
+    );
+  }
+
   const result = await correctiveEdge(
     tx,
     correctiveActionId,
@@ -335,6 +372,10 @@ export async function assignCorrectiveAction(
       assigneeUserId: input.assigneeUserId ?? null,
       assigneeRole: input.assigneeRole ?? null,
       dueAt: input.dueAt ?? null,
+      // Rework reassignment (rejected → assigned): clear the prior attempt's completion stamps so
+      // the row doesn't look completed while it is merely `assigned` again.
+      completedBy: null,
+      completedAt: null,
     },
   );
 
@@ -377,11 +418,14 @@ export async function markCorrectiveActionDone(
   );
 
   // Cascade: last CA done on the parent → resolve the exception (only when it is in_progress).
+  // A CA that already advanced done → verified counts as complete too, so remaining excludes BOTH
+  // `done` AND `verified` — otherwise a CA verified before the last one finishes would wrongly
+  // keep the parent from auto-resolving.
   const remaining = await tx.correctiveAction.count({
     where: {
       exceptionId: result.exceptionId,
       deletedAt: null,
-      status: { not: CorrectiveStatus.done },
+      status: { notIn: [CorrectiveStatus.done, CorrectiveStatus.verified] },
     },
   });
   if (remaining === 0) {
@@ -437,5 +481,25 @@ export async function rejectCorrectiveAction(
     "corrective.rejected",
     actor,
   );
+
+  // Cascade: rejecting this CA's work means the exception is no longer resolved. If the resolve
+  // cascade had already auto-moved the parent to `resolved` (because this CA was done), move it
+  // back resolved → reopened (§7.2) in the same tx (actorLabel 'system:cascade').
+  const parent = await tx.exception.findUniqueOrThrow({
+    where: { id: result.exceptionId },
+    select: { status: true },
+  });
+  if (parent.status === ExceptionStatus.resolved) {
+    await exceptionEdge(
+      tx,
+      result.exceptionId,
+      "reopen",
+      ExceptionStatus.reopened,
+      "exception.reopened",
+      { actorLabel: "system:cascade" },
+      { resolvedAt: null },
+    );
+  }
+
   return { id: result.id, status: result.status };
 }

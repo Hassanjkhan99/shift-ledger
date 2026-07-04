@@ -215,6 +215,81 @@ describe("Exception machine (§7.2)", () => {
     ).rejects.toThrow(/illegal transition/i);
   });
 
+  it("reopen clears resolved_at; the prior value survives in the audit log", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      acknowledgeException(tx, exceptionId, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      startExceptionProgress(tx, exceptionId, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) => resolveException(tx, exceptionId, { actorUserId: userId }));
+
+    const resolved = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(resolved.resolvedAt).not.toBeNull();
+
+    await withTenant(orgAId, (tx) => reopenException(tx, exceptionId, { actorUserId: userId }));
+    const reopened = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(reopened.status).toBe("reopened");
+    expect(reopened.resolvedAt).toBeNull(); // cleared on reopen
+
+    // The prior resolved status remains captured in the reopen edge's before_json audit row.
+    const reopenLog = await logsFor(orgAId, exceptionId, { action: "exception.reopened" });
+    expect(reopenLog).toHaveLength(1);
+    expect(reopenLog[0].beforeJson).toMatchObject({ status: "resolved" });
+  });
+
+  it("stale-status CAS: an edge whose expected `from` row was changed underneath it rejects, no extra audit row", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      acknowledgeException(tx, exceptionId, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      startExceptionProgress(tx, exceptionId, { actorUserId: userId }),
+    );
+    // Row is now `in_progress`. resolve's legal `from` is in_progress.
+
+    const auditBefore = await logsFor(orgAId, exceptionId);
+
+    // Exercise the CAS directly with the same shape exceptionEdge uses: read a (soon-to-be) stale
+    // pre-state, let another writer advance the row, then attempt the conditional updateMany keyed
+    // on the stale `from`. The CAS matches 0 rows → count !== 1. We assert the guard's contract:
+    // the conditional write is a no-op (does not resolve the row) and thus produces no audit row.
+    await withTenant(orgAId, async (tx) => {
+      const preState = await tx.exception.findUniqueOrThrow({
+        where: { id: exceptionId },
+        select: { status: true },
+      });
+      expect(preState.status).toBe("in_progress");
+
+      // A concurrent legal edge wins the race first (in_progress → resolved), committed here.
+      await resolveException(tx, exceptionId, { actorUserId: userId });
+
+      // Now replay the CAS the loser would have issued from its captured `in_progress` pre-state.
+      const cas = await tx.exception.updateMany({
+        where: { id: exceptionId, status: preState.status },
+        data: { status: "resolved" },
+      });
+      expect(cas.count).toBe(0); // lost the race — no row matched the stale `from`
+    });
+
+    // Exactly ONE resolve happened (the winner); the loser's CAS wrote nothing.
+    const resolveLogs = await logsFor(orgAId, exceptionId, { action: "exception.resolved" });
+    expect(resolveLogs).toHaveLength(1);
+    expect((await logsFor(orgAId, exceptionId)).length).toBe(auditBefore.length + 1);
+
+    // And a real edge call from the now-stale state fails loudly (assertFrom / CAS), writing nothing.
+    const auditMid = await logsFor(orgAId, exceptionId);
+    await expect(
+      withTenant(orgAId, (tx) => resolveException(tx, exceptionId, { actorUserId: userId })),
+    ).rejects.toThrow();
+    expect((await logsFor(orgAId, exceptionId)).length).toBe(auditMid.length); // no extra audit row
+  });
+
   it("reopen loop: verified→reopened→acknowledged works", async () => {
     const { exceptionId, userId } = await makeException(orgAId);
     await withTenant(orgAId, (tx) =>
@@ -305,6 +380,77 @@ describe("CorrectiveAction machine (§7.3)", () => {
       assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
     );
     expect(reAssigned.status).toBe("assigned");
+  });
+
+  it("assign requires exactly one assignee (neither → throws, both → throws, one → ok)", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "y" }, { actorUserId: userId }),
+    );
+
+    // Neither assigneeUserId nor assigneeRole → reject before any transition.
+    await expect(
+      withTenant(orgAId, (tx) => assignCorrectiveAction(tx, ca.id, {}, { actorUserId: userId })),
+    ).rejects.toThrow(/exactly one of assigneeUserId or assigneeRole/i);
+
+    // Both provided → reject.
+    await expect(
+      withTenant(orgAId, (tx) =>
+        assignCorrectiveAction(
+          tx,
+          ca.id,
+          { assigneeUserId: userId, assigneeRole: "KitchenManager" },
+          { actorUserId: userId },
+        ),
+      ),
+    ).rejects.toThrow(/exactly one of assigneeUserId or assigneeRole/i);
+
+    // The failed attempts did not transition the CA (still open) and wrote no assigned audit row.
+    const stillOpen = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(stillOpen.status).toBe("open");
+    expect(await logsFor(orgAId, ca.id, { action: "corrective.assigned" })).toHaveLength(0);
+
+    // Exactly one (role only) → ok.
+    const assigned = await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeRole: "KitchenManager" },
+        { actorUserId: userId },
+      ),
+    );
+    expect(assigned.status).toBe("assigned");
+  });
+
+  it("rework reassignment (rejected→assigned) clears stale completedBy/completedAt", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "reseal" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
+
+    const done = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(done.completedBy).toBe(userId);
+    expect(done.completedAt).not.toBeNull();
+
+    await withTenant(orgAId, (tx) => rejectCorrectiveAction(tx, ca.id, { actorUserId: userId }));
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+    );
+
+    const reassigned = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(reassigned.status).toBe("assigned");
+    expect(reassigned.completedBy).toBeNull(); // cleared — the row no longer looks completed
+    expect(reassigned.completedAt).toBeNull();
   });
 
   it("rejects illegal edges: open→done and done→assign(direct)", async () => {
@@ -403,5 +549,80 @@ describe("cascades (§7.2)", () => {
       actorLabel: "system:cascade",
     });
     expect(cascadeResolve).toHaveLength(1);
+  });
+
+  it("a CA that advanced done→verified still counts as complete for the resolve cascade", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      acknowledgeException(tx, exceptionId, { actorUserId: userId }),
+    );
+
+    const ca1 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "CA1" }, { actorUserId: userId }),
+    );
+    const ca2 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "CA2" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(tx, ca1.id, { assigneeUserId: userId }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(tx, ca2.id, { assigneeUserId: userId }, { actorUserId: userId }),
+    );
+
+    // ca1: done → verified BEFORE the last CA finishes. It must still count as complete.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca1.id, { actorUserId: userId }));
+    await withTenant(orgAId, (tx) => verifyCorrectiveAction(tx, ca1.id, { actorUserId: userId }));
+
+    let ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("in_progress"); // ca2 still outstanding
+
+    // Now mark ca2 done → remaining = CAs not in (done, verified) = 0 → exception auto-resolves.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca2.id, { actorUserId: userId }));
+    ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("resolved");
+    expect(ex.resolvedAt).not.toBeNull();
+  });
+
+  it("rejecting a CA whose done-cascade had auto-resolved the exception reopens it", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      acknowledgeException(tx, exceptionId, { actorUserId: userId }),
+    );
+
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "sole CA" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+    );
+    // Sole CA done → resolve cascade auto-moves the exception to resolved.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
+    let ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("resolved");
+
+    // Reject the CA's work → exception no longer resolved → cascade resolved→reopened.
+    const rejected = await withTenant(orgAId, (tx) =>
+      rejectCorrectiveAction(tx, ca.id, { actorUserId: userId }),
+    );
+    expect(rejected.status).toBe("rejected");
+
+    ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("reopened");
+    expect(ex.resolvedAt).toBeNull(); // reopen cleared the stale resolved_at
+
+    const cascadeReopen = await logsFor(orgAId, exceptionId, {
+      action: "exception.reopened",
+      actorLabel: "system:cascade",
+    });
+    expect(cascadeReopen).toHaveLength(1);
   });
 });
