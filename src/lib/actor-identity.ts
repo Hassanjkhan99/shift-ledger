@@ -19,7 +19,7 @@
 
 import { OrgRole } from "../generated/prisma/enums";
 import type { TenantClient } from "./db";
-import { verifyActorPin, type VerifyFailureReason } from "./staff-pin";
+import { verifyActorPin, isEligiblePickUser, type VerifyFailureReason } from "./staff-pin";
 
 // ---- Actor confirmation method domain (mirrors the DB CHECK) --------------------
 
@@ -46,17 +46,51 @@ export function assertValidConfirmationMethod(m: string): asserts m is ActorConf
 /** Typed initials must be 2–4 letters — enough to attribute, no binary attachment needed (D4). */
 const INITIALS_RE = /^[A-Za-z]{2,4}$/;
 
-/** Discriminated input to resolveCompletionActor, one shape per method. */
+/**
+ * Discriminated input to resolveCompletionActor, one shape per method.
+ *
+ * The two shared-tablet flows (`pin`, `initials`) carry the tablet's `outletId`: the picked user is
+ * client-supplied, so the server must re-verify that user is an in-scope, active, completion-capable
+ * member for that outlet before attributing a completion to them (P2 — a tampered request could name
+ * any global user id otherwise). `session` needs no outlet: the actor IS the authenticated session
+ * owner.
+ */
 export type ResolveCompletionActorInput =
   | { method: "session"; sessionUserId: string }
-  | { method: "pin"; organizationId: string; pickedUserId: string; pin: string; now: Date }
-  | { method: "initials"; pickedUserId: string; initials: string };
+  | {
+      method: "pin";
+      organizationId: string;
+      outletId: string;
+      pickedUserId: string;
+      pin: string;
+      now: Date;
+    }
+  | { method: "initials"; outletId: string; pickedUserId: string; initials: string };
 
 /** Why a pin-based actor resolution failed (surfaced instead of throwing on the expected paths). */
 export class ActorPinError extends Error {
   constructor(public readonly reason: VerifyFailureReason) {
     super(`actor-identity: pin actor confirmation failed (${reason})`);
     this.name = "ActorPinError";
+  }
+}
+
+/**
+ * The client-supplied picked user is not an eligible pick user for the tablet's outlet: no active,
+ * non-deleted, completion-capable (non-Auditor/ExternalInspector) membership whose property scope
+ * covers the outlet. Guards both shared-tablet flows against attributing a completion to an
+ * inactive/removed member or another tenant's user.
+ */
+export class IneligiblePickUserError extends Error {
+  constructor(
+    public readonly pickedUserId: string,
+    public readonly outletId: string,
+  ) {
+    super(
+      `actor-identity: picked user '${pickedUserId}' is not an eligible pick user for outlet ` +
+        `'${outletId}' (needs an active, in-scope, completion-capable membership)`,
+    );
+    this.name = "IneligiblePickUserError";
   }
 }
 
@@ -69,7 +103,14 @@ export class ActorPinError extends Error {
  *                 A verification failure (no_pin/locked_out/wrong_pin) throws ActorPinError(reason).
  *  - `initials` — shared tablet: the picked user, confirmed by typed initials (2–4 letters).
  *
- * Takes a tenant `tx` (from withTenant) so the PIN lookup inherits the RLS context.
+ * Both shared-tablet flows additionally re-verify the client-supplied picked user is an eligible
+ * pick user for the tablet's `outletId` (active, non-deleted, in-scope, completion-capable
+ * membership — the same eligibility listPickUsers enforces). verifyActorPin already checks active
+ * membership, but not the OUTLET SCOPE + role (it does not know the outlet), so the check is layered
+ * on for both. An ineligible picked user throws IneligiblePickUserError.
+ *
+ * Takes a tenant `tx` (from withTenant) so the PIN lookup and eligibility check inherit the RLS
+ * context.
  */
 export async function resolveCompletionActor(
   tx: TenantClient,
@@ -91,12 +132,27 @@ export async function resolveCompletionActor(
       if (!result.ok) {
         throw new ActorPinError(result.reason);
       }
+      // verifyActorPin proved active membership but not the outlet scope + completion-capable role
+      // (it does not know the outlet), so layer the pick-eligibility check on top.
+      if (
+        !(await isEligiblePickUser(tx, { outletId: input.outletId, userId: result.actorUserId }))
+      ) {
+        throw new IneligiblePickUserError(result.actorUserId, input.outletId);
+      }
       return { actorUserId: result.actorUserId, method: "pin" };
     }
 
     case "initials": {
       if (!INITIALS_RE.test(input.initials)) {
         throw new Error("actor-identity: initials must be 2–4 letters");
+      }
+      // The picked user id is client-supplied and only FK-checked against global `users`; re-verify
+      // it is an active, in-scope, completion-capable member for this tablet's outlet before
+      // attributing the completion to it.
+      if (
+        !(await isEligiblePickUser(tx, { outletId: input.outletId, userId: input.pickedUserId }))
+      ) {
+        throw new IneligiblePickUserError(input.pickedUserId, input.outletId);
       }
       return { actorUserId: input.pickedUserId, method: "initials" };
     }
@@ -147,6 +203,13 @@ export function mayCreateCorrection(actor: CorrectionActor, target: CorrectionTa
  * Throw unless `actor` may create a correction version for `target` (D7 permission + property scope,
  * §6.2/§6.3). Returns void on allow. This is the guard the M4 #17 versioning writer calls before it
  * performs the (deferred) version-WRITE.
+ *
+ * MODELING LIMITATION (follow-up): D7 says a KitchenManager may correct only within their OUTLET
+ * while a PropertyManager is property-wide, but Membership.propertyScope models scope at the
+ * PROPERTY level only (a `String[]` of property ids — there is no outlet-scope column). So both
+ * scoped roles are treated identically here (property-scoped). Distinguishing KM-outlet from
+ * PM-property needs a schema/data-model change (an outlet-scope dimension on membership); that is a
+ * separate follow-up and is intentionally NOT attempted in this guard.
  */
 export function assertMayCreateCorrection(actor: CorrectionActor, target: CorrectionTarget): void {
   if (!mayCreateCorrection(actor, target)) {

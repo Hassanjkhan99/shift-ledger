@@ -9,6 +9,7 @@ import {
   assertValidConfirmationMethod,
   resolveCompletionActor,
   ActorPinError,
+  IneligiblePickUserError,
   mayCreateCorrection,
   assertMayCreateCorrection,
   type CorrectionActor,
@@ -23,8 +24,14 @@ afterAll(async () => {
   await disconnect();
 });
 
-/** Create a fresh user + active Staff membership in `orgId` (to hang a PIN off). */
-async function makeMember(orgId: string): Promise<{ userId: string }> {
+/**
+ * Create a fresh user + active membership in `orgId` (to hang a PIN off). Defaults to a whole-org
+ * Staff member (eligible to be picked); pass `role`/`propertyScope` to exercise the eligibility gate.
+ */
+async function makeMember(
+  orgId: string,
+  opts: { role?: OrgRole; propertyScope?: string[] } = {},
+): Promise<{ userId: string }> {
   return withTenant(orgId, async (tx) => {
     const user = await tx.user.create({
       data: {
@@ -35,9 +42,22 @@ async function makeMember(orgId: string): Promise<{ userId: string }> {
       select: { id: true },
     });
     await tx.membership.create({
-      data: { organizationId: orgId, userId: user.id, role: OrgRole.Staff, propertyScope: [] },
+      data: {
+        organizationId: orgId,
+        userId: user.id,
+        role: opts.role ?? OrgRole.Staff,
+        propertyScope: opts.propertyScope ?? [],
+      },
     });
     return { userId: user.id };
+  });
+}
+
+/** The seeded outlet + its property for an org (seed creates exactly one of each). */
+async function seededOutlet(orgId: string): Promise<{ outletId: string; propertyId: string }> {
+  return withTenant(orgId, async (tx) => {
+    const outlet = await tx.outlet.findFirstOrThrow({ select: { id: true, propertyId: true } });
+    return { outletId: outlet.id, propertyId: outlet.propertyId };
   });
 }
 
@@ -110,7 +130,8 @@ describe("resolveCompletionActor", () => {
     expect(res).toEqual({ actorUserId: sessionUserId, method: "session" });
   });
 
-  it("pin: a correct PIN returns the picked user + method 'pin'", async () => {
+  it("pin: a correct PIN + eligible picked user returns the picked user + method 'pin'", async () => {
+    const { outletId } = await seededOutlet(orgAId);
     const { userId } = await makeMember(orgAId);
     await withTenant(orgAId, (tx) =>
       setStaffPin(tx, { organizationId: orgAId, userId, pin: "4821" }),
@@ -119,6 +140,7 @@ describe("resolveCompletionActor", () => {
       resolveCompletionActor(tx, {
         method: "pin",
         organizationId: orgAId,
+        outletId,
         pickedUserId: userId,
         pin: "4821",
         now: new Date(),
@@ -128,6 +150,7 @@ describe("resolveCompletionActor", () => {
   });
 
   it("pin: a wrong PIN surfaces the failure as ActorPinError(wrong_pin)", async () => {
+    const { outletId } = await seededOutlet(orgAId);
     const { userId } = await makeMember(orgAId);
     await withTenant(orgAId, (tx) =>
       setStaffPin(tx, { organizationId: orgAId, userId, pin: "1234" }),
@@ -137,6 +160,7 @@ describe("resolveCompletionActor", () => {
         resolveCompletionActor(tx, {
           method: "pin",
           organizationId: orgAId,
+          outletId,
           pickedUserId: userId,
           pin: "0000",
           now: new Date(),
@@ -146,12 +170,14 @@ describe("resolveCompletionActor", () => {
   });
 
   it("pin: a member with no PIN surfaces ActorPinError(no_pin)", async () => {
+    const { outletId } = await seededOutlet(orgAId);
     const { userId } = await makeMember(orgAId);
     await expect(
       withTenant(orgAId, (tx) =>
         resolveCompletionActor(tx, {
           method: "pin",
           organizationId: orgAId,
+          outletId,
           pickedUserId: userId,
           pin: "1111",
           now: new Date(),
@@ -160,23 +186,82 @@ describe("resolveCompletionActor", () => {
     ).rejects.toBeInstanceOf(ActorPinError);
   });
 
-  it("initials: non-empty initials return the picked user + method 'initials'", async () => {
-    const pickedUserId = randomUUID();
-    const res = await withTenant(orgAId, (tx) =>
-      resolveCompletionActor(tx, { method: "initials", pickedUserId, initials: "AB" }),
+  it("pin: a correct PIN but a picked user NOT in the outlet's scope is rejected (IneligiblePickUserError)", async () => {
+    const { outletId } = await seededOutlet(orgAId);
+    // Member scoped to a DIFFERENT property — verifyActorPin passes (active membership) but the
+    // outlet-scope layer must reject.
+    const { userId } = await makeMember(orgAId, { propertyScope: [randomUUID()] });
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "7777" }),
     );
-    expect(res).toEqual({ actorUserId: pickedUserId, method: "initials" });
+    await expect(
+      withTenant(orgAId, (tx) =>
+        resolveCompletionActor(tx, {
+          method: "pin",
+          organizationId: orgAId,
+          outletId,
+          pickedUserId: userId,
+          pin: "7777",
+          now: new Date(),
+        }),
+      ),
+    ).rejects.toBeInstanceOf(IneligiblePickUserError);
+  });
+
+  it("initials: non-empty initials + an eligible picked user return the picked user + method 'initials'", async () => {
+    const { outletId } = await seededOutlet(orgAId);
+    const { userId } = await makeMember(orgAId);
+    const res = await withTenant(orgAId, (tx) =>
+      resolveCompletionActor(tx, {
+        method: "initials",
+        outletId,
+        pickedUserId: userId,
+        initials: "AB",
+      }),
+    );
+    expect(res).toEqual({ actorUserId: userId, method: "initials" });
   });
 
   it("initials: empty/invalid initials are rejected", async () => {
+    const { outletId } = await seededOutlet(orgAId);
     const pickedUserId = randomUUID();
     for (const initials of ["", "A", "ABCDE", "12", "A1"]) {
       await expect(
         withTenant(orgAId, (tx) =>
-          resolveCompletionActor(tx, { method: "initials", pickedUserId, initials }),
+          resolveCompletionActor(tx, { method: "initials", outletId, pickedUserId, initials }),
         ),
       ).rejects.toThrow(/initials/);
     }
+  });
+
+  it("initials: a well-formed-initials but non-member picked user id is rejected (IneligiblePickUserError)", async () => {
+    const { outletId } = await seededOutlet(orgAId);
+    // A random global user id with no membership at all — format-valid initials must not attribute.
+    await expect(
+      withTenant(orgAId, (tx) =>
+        resolveCompletionActor(tx, {
+          method: "initials",
+          outletId,
+          pickedUserId: randomUUID(),
+          initials: "AB",
+        }),
+      ),
+    ).rejects.toBeInstanceOf(IneligiblePickUserError);
+  });
+
+  it("initials: an Auditor (read-only role) picked user is rejected (IneligiblePickUserError)", async () => {
+    const { outletId } = await seededOutlet(orgAId);
+    const { userId } = await makeMember(orgAId, { role: OrgRole.Auditor });
+    await expect(
+      withTenant(orgAId, (tx) =>
+        resolveCompletionActor(tx, {
+          method: "initials",
+          outletId,
+          pickedUserId: userId,
+          initials: "AB",
+        }),
+      ),
+    ).rejects.toBeInstanceOf(IneligiblePickUserError);
   });
 });
 

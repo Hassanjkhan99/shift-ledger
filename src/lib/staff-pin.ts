@@ -295,3 +295,27 @@ export async function listPickUsers(
 
   return memberships.map((m) => ({ userId: m.userId, name: m.user.name, role: m.role }));
 }
+
+/**
+ * Server-side pick-eligibility check for a single user against a tablet's outlet: does `userId` have
+ * an active, non-deleted, completion-capable membership whose scope covers the outlet's property?
+ * The SAME predicate listPickUsers builds from (pickEligibleWhere), factored out so a resolved actor
+ * (pin/initials) is re-validated server-side rather than trusting a client-supplied user id. Fails
+ * closed: a soft-deleted/missing outlet (or one under a deleted property) yields false.
+ */
+export async function isEligiblePickUser(
+  tx: TenantClient,
+  args: { outletId: string; userId: string },
+): Promise<boolean> {
+  const outlet = await tx.outlet.findFirst({
+    where: { id: args.outletId, deletedAt: null, property: { deletedAt: null } },
+    select: { propertyId: true },
+  });
+  if (!outlet) return false;
+
+  const membership = await tx.membership.findFirst({
+    where: { userId: args.userId, ...pickEligibleWhere(outlet.propertyId) },
+    select: { id: true },
+  });
+  return membership !== null;
+}
