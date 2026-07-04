@@ -41,7 +41,13 @@ CREATE TABLE "task_completions" (
     "edit_reason" TEXT,
     "created_at" TIMESTAMPTZ(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT "task_completions_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "task_completions_pkey" PRIMARY KEY ("id"),
+    -- version is 1-based and monotonic; a non-positive version is meaningless (P2).
+    CONSTRAINT "task_completions_version_positive" CHECK ("version" >= 1),
+    -- A corrected version (v>=2) must carry its provenance: WHY (edit_reason) and WHAT it replaces
+    -- (supersedes_id). v1 is the original and carries neither (P2).
+    CONSTRAINT "task_completions_correction_provenance"
+      CHECK ("version" = 1 OR ("edit_reason" IS NOT NULL AND "supersedes_id" IS NOT NULL))
 );
 
 -- §8.15 evidence (immutable / append-only)
@@ -118,6 +124,21 @@ CREATE POLICY "tenant_isolation" ON "evidence"
 -- The narrow is_current-flip needed by versioned corrections is a SECURITY DEFINER path
 -- deferred to M4 #17; until then these tables are fully immutable.
 -- ============================================================================
+
+-- F3 — recorded_at is server-authoritative (defense in depth over the column DEFAULT). A DEFAULT only
+-- fires when the INSERT omits the column; a caller bypassing buildCompletionInsert() could still supply
+-- a backdated recorded_at. This BEFORE INSERT trigger unconditionally overwrites it with now(), so the
+-- compliance timestamp can never be driven by the client. (client_reported_at stays advisory, untouched.)
+CREATE OR REPLACE FUNCTION set_task_completion_recorded_at() RETURNS trigger AS $$
+BEGIN
+  NEW.recorded_at := now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER "task_completions_stamp_recorded_at"
+  BEFORE INSERT ON "task_completions"
+  FOR EACH ROW EXECUTE FUNCTION set_task_completion_recorded_at();
 
 CREATE OR REPLACE FUNCTION reject_task_completion_mutation() RETURNS trigger AS $$
 BEGIN

@@ -390,8 +390,10 @@ model TaskCompletion {
   id                      String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
   organizationId          String           @map("organization_id") @db.Uuid
   taskOccurrenceId        String           @map("task_occurrence_id") @db.Uuid
+  /// 1-based, monotonic per occurrence. DB CHECK enforces version >= 1 (Prisma can't express it).
   version                 Int              @default(1)
   isCurrent               Boolean          @default(true) @map("is_current")
+  /// Prior version this row corrects. DB CHECK enforces v>=2 carries edit_reason + supersedes_id.
   supersedesId            String?          @map("supersedes_id") @db.Uuid
   clientSubmissionId      String           @map("client_submission_id") @db.Uuid
   result                  CompletionResult
@@ -399,9 +401,12 @@ model TaskCompletion {
   measuredNumeric         Decimal?         @map("measured_numeric") @db.Decimal
   completedBy             String           @map("completed_by") @db.Uuid
   actorConfirmationMethod String           @default("session") @map("actor_confirmation_method")
+  /// F3 compliance timestamp. Server-authoritative: a BEFORE INSERT trigger unconditionally overwrites
+  /// any supplied value with now(), so the client can never drive it (the @default is belt-and-braces).
   recordedAt              DateTime         @default(now()) @map("recorded_at") @db.Timestamptz(6)
   clientReportedAt        DateTime?        @map("client_reported_at") @db.Timestamptz(6)
   deviceMetaJson          Json?            @map("device_meta_json")
+  /// Why this correction was made. DB CHECK enforces v>=2 carries it (with supersedes_id).
   editReason              String?          @map("edit_reason")
   createdAt               DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
 

@@ -205,6 +205,36 @@ describe("F3 — recorded_at is server-authoritative, client_reported_at is advi
     expect(completion.recordedAt.getTime()).toBeGreaterThanOrEqual(before - 5_000);
   });
 
+  it("a backdated recorded_at supplied directly (bypassing the helper) is overwritten by the server", async () => {
+    // buildCompletionInsert never emits recorded_at, so the only way to attempt a backdate is to
+    // bypass it and set recordedAt directly through Prisma — the exact bypass the BEFORE INSERT
+    // trigger defends against. The stored value must be ≈ now(), not the year-2000 value supplied.
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    const backdated = new Date("2000-01-01T00:00:00Z");
+    const before = Date.now();
+    const completion = await withTenant(orgAId, (tx) =>
+      tx.taskCompletion.create({
+        data: {
+          ...buildCompletionInsert({
+            organizationId: orgAId,
+            taskOccurrenceId: occurrenceId,
+            clientSubmissionId: randomUUID(),
+            result: "pass",
+            completedBy: userId,
+          }),
+          recordedAt: backdated, // forced backdate — trigger must overwrite this
+        },
+        select: { recordedAt: true },
+      }),
+    );
+    // The trigger overwrites the year-2000 backdate with the server clock (withTenant pins the
+    // session to UTC, so the timestamptz decodes as the true instant).
+    const recorded = completion.recordedAt.getTime();
+    expect(recorded).not.toBe(backdated.getTime());
+    expect(recorded).toBeGreaterThanOrEqual(before - 5_000);
+    expect(recorded).toBeLessThanOrEqual(Date.now() + 5_000);
+  });
+
   it("buildCompletionInsert never emits a recordedAt key (F3 by construction)", () => {
     const data = buildCompletionInsert({
       organizationId: orgAId,
@@ -307,5 +337,88 @@ describe("idempotency constraint + versioning defaults", () => {
         }),
       ),
     ).rejects.toThrow();
+  });
+});
+
+describe("versioning invariants (DB CHECK constraints)", () => {
+  it("rejects a non-positive version (version >= 1)", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.taskCompletion.create({
+          data: {
+            ...buildCompletionInsert({
+              organizationId: orgAId,
+              taskOccurrenceId: occurrenceId,
+              clientSubmissionId: randomUUID(),
+              result: "pass",
+              completedBy: userId,
+            }),
+            version: 0, // violates task_completions_version_positive
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a v2 without correction provenance (edit_reason + supersedes_id required)", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.taskCompletion.create({
+          data: {
+            ...buildCompletionInsert({
+              organizationId: orgAId,
+              taskOccurrenceId: occurrenceId,
+              clientSubmissionId: randomUUID(),
+              result: "pass",
+              completedBy: userId,
+            }),
+            version: 2,
+            isCurrent: false, // avoid the partial current-guard; this is a provenance test
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("accepts a v2 that carries edit_reason + supersedes_id", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    // A valid v1 to supersede; make it non-current so v2 can be the current row.
+    const v1 = await withTenant(orgAId, (tx) =>
+      tx.taskCompletion.create({
+        data: {
+          ...buildCompletionInsert({
+            organizationId: orgAId,
+            taskOccurrenceId: occurrenceId,
+            clientSubmissionId: randomUUID(),
+            result: "pass",
+            completedBy: userId,
+          }),
+          isCurrent: false,
+        },
+        select: { id: true },
+      }),
+    );
+
+    const v2 = await withTenant(orgAId, (tx) =>
+      tx.taskCompletion.create({
+        data: {
+          ...buildCompletionInsert({
+            organizationId: orgAId,
+            taskOccurrenceId: occurrenceId,
+            clientSubmissionId: randomUUID(),
+            result: "fail",
+            completedBy: userId,
+          }),
+          version: 2,
+          isCurrent: true,
+          supersedesId: v1.id,
+          editReason: "temperature misread on first entry",
+        },
+        select: { id: true, version: true },
+      }),
+    );
+    expect(v2.version).toBe(2);
   });
 });
