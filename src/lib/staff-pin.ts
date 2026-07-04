@@ -20,6 +20,7 @@
 import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { TenantClient } from "./db";
 import { logActivity } from "./transition";
+import { OCCURRENCE_ROLE_MATRIX } from "./permissions";
 
 // ---- Named constants ------------------------------------------------------------
 export const PIN_LENGTH = 4;
@@ -40,7 +41,7 @@ const PIN_RE = /^\d{4}$/;
 // ---- Result types ---------------------------------------------------------------
 
 /** Discriminated failure reasons so callers/tests can distinguish the paths. */
-export type VerifyFailureReason = "no_pin" | "locked_out" | "wrong_pin";
+export type VerifyFailureReason = "no_pin" | "locked_out" | "wrong_pin" | "no_membership";
 
 export type VerifyActorPinResult =
   | { ok: true; actorUserId: string }
@@ -124,10 +125,17 @@ export async function setStaffPin(
  * Behavior:
  *   - No PIN row            -> { ok: false, reason: 'no_pin' }
  *   - locked_until > now    -> { ok: false, reason: 'locked_out', lockedUntil }
+ *   - correct pin, but no active/non-deleted membership -> { ok: false, reason: 'no_membership' }
+ *                              (NOT counted as a wrong-PIN attempt — it is not a bad guess)
  *   - correct pin           -> reset failed_attempts=0 / locked_until=null, { ok: true, actorUserId }
- *   - wrong pin             -> increment failed_attempts; on reaching MAX_FAILED_ATTEMPTS set
- *                              locked_until = now + LOCKOUT_MINUTES and write an
- *                              `actor.pin_lockout` activity_log entry (non-PII). { ok: false, reason: 'wrong_pin' | 'locked_out' }
+ *   - wrong pin             -> atomically increment failed_attempts; on the RESULTING value reaching
+ *                              MAX_FAILED_ATTEMPTS set locked_until = now + LOCKOUT_MINUTES and write
+ *                              an `actor.pin_lockout` activity_log entry (non-PII).
+ *                              { ok: false, reason: 'wrong_pin' | 'locked_out' }
+ *
+ * The failure counter is incremented with an atomic DB `{ increment: 1 }` and the lockout decision is
+ * derived from the RETURNED value, so concurrent wrong guesses cannot each persist failed_attempts=1
+ * and skip the lockout — the threshold can only be crossed once, by the request that increments to it.
  */
 export async function verifyActorPin(
   tx: TenantClient,
@@ -145,6 +153,15 @@ export async function verifyActorPin(
   }
 
   if (verifyPinHash(pin, row.pinHash)) {
+    // The PIN is correct, but the actor must still have an active, non-deleted membership in this
+    // org — otherwise a stale shared-tablet completion could be attributed to a deactivated/removed
+    // member. This is NOT a bad guess, so it does not touch the failure counter.
+    const membership = await tx.membership.findFirst({
+      where: { organizationId, userId, status: "active", deletedAt: null },
+      select: { id: true },
+    });
+    if (!membership) return { ok: false, reason: "no_membership" };
+
     await tx.staffPin.update({
       where: { id: row.id },
       data: { failedAttempts: 0, lockedUntil: null },
@@ -152,17 +169,22 @@ export async function verifyActorPin(
     return { ok: true, actorUserId: userId };
   }
 
-  // Wrong pin: increment the failure counter and lock out on the threshold.
-  const failedAttempts = row.failedAttempts + 1;
-  const shouldLock = failedAttempts >= MAX_FAILED_ATTEMPTS;
-  const lockedUntil = shouldLock ? new Date(now.getTime() + LOCKOUT_MINUTES * 60_000) : null;
-
-  await tx.staffPin.update({
+  // Wrong pin: increment the failure counter ATOMICALLY and derive the lockout decision from the
+  // returned value, so concurrent wrong guesses cannot each write failed_attempts=1 and dodge the
+  // lockout (the threshold is crossed exactly once — by the request that increments to it).
+  const updated = await tx.staffPin.update({
     where: { id: row.id },
-    data: { failedAttempts, lockedUntil },
+    data: { failedAttempts: { increment: 1 } },
+    select: { failedAttempts: true },
   });
+  const shouldLock = updated.failedAttempts >= MAX_FAILED_ATTEMPTS;
 
   if (shouldLock) {
+    const lockedUntil = new Date(now.getTime() + LOCKOUT_MINUTES * 60_000);
+    await tx.staffPin.update({
+      where: { id: row.id },
+      data: { lockedUntil },
+    });
     // Audit the lockout — non-PII payload only (no pin, no hash).
     await logActivity(tx, {
       organizationId,
@@ -171,12 +193,12 @@ export async function verifyActorPin(
       action: "actor.pin_lockout",
       actorLabel: "system:pin-lockout",
       afterJson: {
-        failedAttempts,
-        lockedUntil: lockedUntil!.toISOString(),
+        failedAttempts: updated.failedAttempts,
+        lockedUntil: lockedUntil.toISOString(),
         lockoutMinutes: LOCKOUT_MINUTES,
       },
     });
-    return { ok: false, reason: "locked_out", lockedUntil: lockedUntil! };
+    return { ok: false, reason: "locked_out", lockedUntil };
   }
 
   return { ok: false, reason: "wrong_pin" };
@@ -191,10 +213,22 @@ export interface PickUser {
 }
 
 /**
+ * Roles that may complete an occurrence on a shared tablet — the §7.1 completion set (from the
+ * occurrence role matrix). Read-only roles (Auditor, ExternalInspector) are NOT in this set, so they
+ * never appear in the pick list even if a membership scopes them to the outlet's property.
+ */
+const COMPLETION_CAPABLE_ROLES = OCCURRENCE_ROLE_MATRIX.complete;
+
+/**
  * The on-device pick-user list: active, non-deleted memberships whose scope covers the tablet's
- * outlet. A membership covers the outlet if its property_scope is EMPTY (whole-org) OR contains the
- * outlet's property_id. Resolves the outlet's property first, then queries memberships. All through
- * the tenant `tx` (RLS), so it is implicitly org-scoped.
+ * outlet AND whose role can complete a task. A membership covers the outlet if its property_scope is
+ * NULL or EMPTY (whole-org) OR contains the outlet's property_id. Resolves the outlet's property
+ * first, then queries memberships. All through the tenant `tx` (RLS), so it is implicitly org-scoped.
+ *
+ * NULL scope: the `memberships.property_scope` column is a Postgres array WITHOUT a NOT NULL
+ * constraint (see the init migration), so a NULL is possible even though Prisma defaults inserts to
+ * `[]`. Prisma's `isEmpty`/`has` array filters do NOT match NULL, so NULL is handled explicitly as
+ * whole-org here.
  */
 export async function listPickUsers(
   tx: TenantClient,
@@ -209,7 +243,12 @@ export async function listPickUsers(
     where: {
       status: "active",
       deletedAt: null,
-      OR: [{ propertyScope: { isEmpty: true } }, { propertyScope: { has: outlet.propertyId } }],
+      role: { in: [...COMPLETION_CAPABLE_ROLES] },
+      OR: [
+        { propertyScope: { equals: null } },
+        { propertyScope: { isEmpty: true } },
+        { propertyScope: { has: outlet.propertyId } },
+      ],
     },
     select: { userId: true, role: true, user: { select: { name: true } } },
   });

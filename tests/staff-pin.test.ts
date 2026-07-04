@@ -118,6 +118,31 @@ describe("setStaffPin + verifyActorPin (integration)", () => {
     expect(row.failedAttempts).toBe(1);
   });
 
+  it("rejects a correct pin with no_membership when the membership was soft-deleted (not counted as a wrong attempt)", async () => {
+    const { userId } = await makeMember(orgAId);
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "3141" }),
+    );
+    // Soft-delete the membership AFTER the PIN was issued.
+    await withTenant(orgAId, (tx) =>
+      tx.membership.updateMany({ where: { userId }, data: { deletedAt: new Date() } }),
+    );
+
+    const res = await withTenant(orgAId, (tx) =>
+      verifyActorPin(tx, { organizationId: orgAId, userId, pin: "3141", now: new Date() }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe("no_membership");
+
+    // A correct-pin-but-no-membership rejection is NOT a bad guess -> failure counter untouched.
+    const row = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    expect(row.failedAttempts).toBe(0);
+  });
+
   it("verifyActorPin returns no_pin when the member has no PIN set", async () => {
     const { userId } = await makeMember(orgAId);
     const res = await withTenant(orgAId, (tx) =>
@@ -205,6 +230,44 @@ describe("lockout after repeated failures", () => {
     expect(row.failedAttempts).toBe(0);
     expect(row.lockedUntil).toBeNull();
   });
+
+  it("counter regression: each wrong attempt increments by exactly one and locks out at exactly MAX", async () => {
+    const { userId } = await makeMember(orgAId);
+    const now = new Date("2026-07-04T09:00:00Z");
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "6060" }),
+    );
+
+    // Attempts 1..MAX-1: still wrong_pin, counter climbs 1,2,...,MAX-1 (never skipped or stuck).
+    for (let i = 1; i < MAX_FAILED_ATTEMPTS; i++) {
+      const res = await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now }),
+      );
+      expect(res.ok).toBe(false);
+      if (!res.ok) expect(res.reason).toBe("wrong_pin");
+      const row = await withTenant(orgAId, (tx) =>
+        tx.staffPin.findUniqueOrThrow({
+          where: { organizationId_userId: { organizationId: orgAId, userId } },
+        }),
+      );
+      expect(row.failedAttempts).toBe(i);
+      expect(row.lockedUntil).toBeNull();
+    }
+
+    // The MAX-th wrong attempt crosses the threshold and locks out.
+    const atMax = await withTenant(orgAId, (tx) =>
+      verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now }),
+    );
+    expect(atMax.ok).toBe(false);
+    if (!atMax.ok) expect(atMax.reason).toBe("locked_out");
+    const locked = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    expect(locked.failedAttempts).toBe(MAX_FAILED_ATTEMPTS);
+    expect(locked.lockedUntil).not.toBeNull();
+  });
 });
 
 // ---- pick-user list scoping -----------------------------------------------------
@@ -248,6 +311,34 @@ describe("listPickUsers (§8.8 scoping)", () => {
     expect(ids).not.toContain(otherProperty.userId);
     expect(ids).not.toContain(inactive.userId);
     expect(ids).not.toContain(deleted.userId);
+  });
+
+  it("excludes read-only roles (Auditor) but includes completion-capable roles (Staff/KitchenManager)", async () => {
+    const { outletId, propertyId } = await seededOutlet(orgAId);
+
+    const staff = await makeMember(orgAId, {
+      propertyScope: [propertyId],
+      role: "Staff",
+      name: "PickStaff",
+    });
+    const manager = await makeMember(orgAId, {
+      propertyScope: [propertyId],
+      role: "KitchenManager",
+      name: "PickManager",
+    });
+    // An active Auditor scoped to this outlet's property must NOT be pickable (read-only role).
+    const auditor = await makeMember(orgAId, {
+      propertyScope: [propertyId],
+      role: "Auditor",
+      name: "PickAuditor",
+    });
+
+    const picked = await withTenant(orgAId, (tx) => listPickUsers(tx, { outletId }));
+    const ids = picked.map((p) => p.userId);
+
+    expect(ids).toContain(staff.userId);
+    expect(ids).toContain(manager.userId);
+    expect(ids).not.toContain(auditor.userId);
   });
 });
 
