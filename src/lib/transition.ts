@@ -52,6 +52,9 @@ export interface ActivityLogEntry {
  * SECURITY DEFINER hash-chain function. Do NOT insert into activity_log from anywhere else.
  */
 export function logActivity(tx: TenantClient, entry: ActivityLogEntry): Promise<{ id: string }> {
+  // Enforce the attribution invariant at the write boundary too, not only in transition() — this
+  // is the exported seam every audit write goes through, incl. direct non-status logs.
+  assertExactlyOneActor(entry.actorUserId, entry.actorLabel);
   return tx.activityLog.create({
     data: {
       organizationId: entry.organizationId,
@@ -98,6 +101,24 @@ function isBlank(value: string | undefined): boolean {
 }
 
 /**
+ * Every audit row must have exactly one actor. "Set" means present AND non-blank — a blank/
+ * whitespace `actorLabel` (e.g. a missing env-derived cron label) is NOT a valid system actor and
+ * must not commit a status change attributed to empty text.
+ */
+function assertExactlyOneActor(
+  actorUserId: string | undefined,
+  actorLabel: string | undefined,
+): void {
+  const hasUser = !isBlank(actorUserId);
+  const hasLabel = !isBlank(actorLabel);
+  if (hasUser === hasLabel) {
+    throw new Error(
+      "exactly one of actorUserId (user actor) or actorLabel (system actor) must be a non-empty value",
+    );
+  }
+}
+
+/**
  * Perform a state transition atomically: run the caller's mutation and write the audit row in
  * the SAME transaction. Runs inside a caller-provided `tx` (from withTenant), so it inherits
  * the tenant RLS context and shares the mutation's atomicity.
@@ -113,13 +134,7 @@ function isBlank(value: string | undefined): boolean {
  * and the audit insert — they can never diverge.
  */
 export async function transition<T>(tx: TenantClient, opts: TransitionOptions<T>): Promise<T> {
-  const hasUser = opts.actorUserId !== undefined;
-  const hasLabel = opts.actorLabel !== undefined;
-  if (hasUser === hasLabel) {
-    throw new Error(
-      "transition(): exactly one of actorUserId (user actor) or actorLabel (system actor) must be set",
-    );
-  }
+  assertExactlyOneActor(opts.actorUserId, opts.actorLabel);
   if (opts.requireReason && isBlank(opts.reason)) {
     throw new Error(`transition(): action '${opts.action}' requires a non-empty reason`);
   }

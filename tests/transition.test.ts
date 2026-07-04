@@ -1,6 +1,6 @@
 import { describe, it, expect, inject, afterAll } from "vitest";
 import { withTenant, disconnect } from "../src/lib/db";
-import { transition } from "../src/lib/transition";
+import { transition, logActivity } from "../src/lib/transition";
 
 // Exercise the F4 choke point against memberships.status — a real status column that exists
 // today — so we prove the mechanism without depending on later-milestone tables. Each test
@@ -213,6 +213,41 @@ describe("transition() — F4 choke point atomicity", () => {
           actorUserId: membership.userId,
           actorLabel: "system:test",
           mutate: (t) => Promise.resolve(t),
+        }),
+      ),
+    ).rejects.toThrow(/exactly one of actorUserId/);
+  });
+
+  it("rejects a blank/whitespace system actorLabel (no completion attributed to empty text)", async () => {
+    const membership = await anyMembership();
+    const action = "test.transition.blanklabel";
+    await expect(
+      withTenant(orgAId, (tx) =>
+        transition(tx, {
+          organizationId: orgAId,
+          subjectType: "membership",
+          subjectId: membership.id,
+          action,
+          actorLabel: "   ", // blank -> not a valid system actor
+          mutate: (t) =>
+            t.membership.update({ where: { id: membership.id }, data: { status: "active" } }),
+        }),
+      ),
+    ).rejects.toThrow(/exactly one of actorUserId/);
+
+    const logs = await withTenant(orgAId, (tx) => tx.activityLog.findMany({ where: { action } }));
+    expect(logs).toHaveLength(0); // no row committed under a blank actor
+  });
+
+  it("logActivity enforces the actor invariant at the write boundary too", async () => {
+    const membership = await anyMembership();
+    await expect(
+      withTenant(orgAId, (tx) =>
+        logActivity(tx, {
+          organizationId: orgAId,
+          subjectType: "membership",
+          subjectId: membership.id,
+          action: "test.logactivity.noactor",
         }),
       ),
     ).rejects.toThrow(/exactly one of actorUserId/);
