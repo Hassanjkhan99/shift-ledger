@@ -435,6 +435,7 @@ async function occurrenceManagerEdge(
         `(legal from: ${legalFrom.join(", ")})`,
     );
   }
+  const expectedFrom = current.status;
 
   return transition(tx, {
     organizationId: current.organizationId,
@@ -446,12 +447,24 @@ async function occurrenceManagerEdge(
     after: { status: to },
     reason: actor.reason,
     requireReason: true, // §7.1 / D7: skip & cancel require a reason
-    mutate: (t) =>
-      t.taskOccurrence.update({
-        where: { id: occurrenceId },
+    // Compare-and-set: only flip if the row is still in the status we read (expectedFrom). Two
+    // concurrent manager edges from the same state (e.g. a skip and a cancel both from `due`) would
+    // otherwise both commit; here the loser matches 0 rows — count !== 1 — and we THROW so the whole
+    // transition rolls back (no status change, no audit row). This is a USER edge: it fails loudly,
+    // unlike the system sweep's silent didMutate no-op. (Mirrors the #9 exception/CA edges.)
+    mutate: async (t) => {
+      const res = await t.taskOccurrence.updateMany({
+        where: { id: occurrenceId, status: expectedFrom },
         data: { status: to },
-        select: { id: true, status: true },
-      }),
+      });
+      if (res.count !== 1) {
+        throw new Error(
+          `occurrence: concurrent modification — transition to '${to}' expected status ` +
+            `'${expectedFrom}' but the row changed underneath`,
+        );
+      }
+      return { id: occurrenceId, status: to };
+    },
   });
 }
 

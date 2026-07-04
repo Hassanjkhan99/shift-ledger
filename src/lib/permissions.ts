@@ -89,15 +89,13 @@ export const CORRECTIVE_ROLE_MATRIX = {
   ],
   // open→assigned and rejected→assigned: managers.
   assign: [OrgRole.KitchenManager, OrgRole.PropertyManager, OrgRole.Owner, OrgRole.OrgAdmin],
-  // assigned→done: the assignee (any scoped role incl. Staff) or a manager.
-  markDone: [
-    OrgRole.Staff,
-    OrgRole.ShiftLeader,
-    OrgRole.KitchenManager,
-    OrgRole.PropertyManager,
-    OrgRole.Owner,
-    OrgRole.OrgAdmin,
-  ],
+  // assigned→done: managers only by ROLE alone. §7.3 also lets the ASSIGNED frontline actor
+  // (a Staff/ShiftLeader) mark their OWN corrective action done — but that is an ASSIGNEE
+  // exception that needs the row's assignee_user_id/assignee_role, which this role-only guard
+  // does not have. It is therefore enforced at the action layer with row context (M4 #17), NOT
+  // here. Listing Staff/ShiftLeader in this role-only matrix would let ANY frontline user mark
+  // ANY CA done, so they are deliberately omitted.
+  markDone: [OrgRole.KitchenManager, OrgRole.PropertyManager, OrgRole.Owner, OrgRole.OrgAdmin],
   // done→verified: managers.
   verify: [OrgRole.PropertyManager, OrgRole.KitchenManager, OrgRole.Owner, OrgRole.OrgAdmin],
   // done→rejected: managers.

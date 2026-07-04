@@ -112,8 +112,17 @@ describe("assertRoleMayTrigger — role matrix", () => {
     expect(() => assertRoleMayTrigger("exception", "acknowledge", OrgRole.Staff)).toThrow();
   });
 
-  it("correctiveAction.markDone: Staff (the assignee) passes; verify is managers-only", () => {
-    expect(() => assertRoleMayTrigger("correctiveAction", "markDone", OrgRole.Staff)).not.toThrow();
+  it("correctiveAction.markDone: managers-only by role (assignee exception is action-layer, M4 #17)", () => {
+    // §7.3: by ROLE alone only managers may mark done. A frontline assignee marking their OWN CA
+    // done is enforced with row context at the action layer, NOT by this role-only guard — so
+    // Staff/ShiftLeader are rejected here.
+    expect(() =>
+      assertRoleMayTrigger("correctiveAction", "markDone", OrgRole.KitchenManager),
+    ).not.toThrow();
+    expect(() => assertRoleMayTrigger("correctiveAction", "markDone", OrgRole.Staff)).toThrow();
+    expect(() =>
+      assertRoleMayTrigger("correctiveAction", "markDone", OrgRole.ShiftLeader),
+    ).toThrow();
     expect(() => assertRoleMayTrigger("correctiveAction", "verify", OrgRole.Staff)).toThrow();
     expect(() =>
       assertRoleMayTrigger("correctiveAction", "verify", OrgRole.PropertyManager),
@@ -178,6 +187,46 @@ describe("skipOccurrence / cancelOccurrence", () => {
     }));
     expect(occ.status).toBe("due"); // unchanged
     expect(logCount).toBe(0); // no orphan log
+  });
+
+  it("stale skip/cancel CAS: a manager edge whose `from` row changed underneath rejects, no extra audit row", async () => {
+    const site = await makeSite(orgAId);
+    const occId = await seedOccurrence(orgAId, site, "due", new Date(Date.UTC(2026, 6, 14)));
+
+    // Winner: skip the occurrence (due → skipped), committed.
+    await withTenant(orgAId, (tx) =>
+      skipOccurrence(tx, occId, { actorUserId: site.userId, reason: "outlet closed" }),
+    );
+
+    const auditBefore = await withTenant(orgAId, (tx) =>
+      tx.activityLog.count({ where: { subjectId: occId } }),
+    );
+
+    // Loser: replay the conditional updateMany the compare-and-set issues, keyed on the now-stale
+    // `due` from-state. It must match 0 rows (row is `skipped`), proving a lost race is a no-op that
+    // neither clobbers the terminal status nor could produce an audit row.
+    await withTenant(orgAId, async (tx) => {
+      const cas = await tx.taskOccurrence.updateMany({
+        where: { id: occId, status: "due" },
+        data: { status: "cancelled" }, // f4-guard-allow: test replay of the CAS the edge issues
+      });
+      expect(cas.count).toBe(0);
+    });
+
+    // A real cancel from the now-terminal state also fails loudly (illegal-from / CAS) and writes
+    // nothing — the occurrence stays `skipped` and no extra audit row is appended.
+    await expect(
+      withTenant(orgAId, (tx) =>
+        cancelOccurrence(tx, occId, { actorUserId: site.userId, reason: "too late" }),
+      ),
+    ).rejects.toThrow();
+
+    const { occ, auditAfter } = await withTenant(orgAId, async (tx) => ({
+      occ: await tx.taskOccurrence.findUniqueOrThrow({ where: { id: occId } }),
+      auditAfter: await tx.activityLog.count({ where: { subjectId: occId } }),
+    }));
+    expect(occ.status).toBe("skipped"); // unchanged by the loser
+    expect(auditAfter).toBe(auditBefore); // no extra audit row from the lost race
   });
 
   it("cancel from an illegal from-state (overdue) is rejected", async () => {
@@ -338,6 +387,40 @@ describe("evaluateRepeatedDeviation", () => {
       }),
     );
     expect(res.requested.find((r) => r.groupingKey === "scheduledTask+outlet")).toBeUndefined();
+  });
+
+  it("counts by the outlet's LOCAL calendar window at a UTC/local date boundary", async () => {
+    // `now` is late in the UTC day (23:30Z) but the Europe/Berlin outlet is already on the NEXT
+    // local day (01:30 local, 2026-07-21). The 7-day LOCAL window is therefore [2026-07-15 ..
+    // 2026-07-21]. The OLD instant-based math (now − 7×24h = 2026-07-13T23:30Z compared against a
+    // date column) would have wrongly pulled 2026-07-14 into the window; the local-date window must
+    // exclude it. We assert both: the three in-window local dates trip the threshold with count 3,
+    // and a 2026-07-14 failure (outside the local window) is NOT counted.
+    const boundaryNow = new Date("2026-07-20T23:30:00Z");
+    const site = await makeSite(orgAId);
+    const utcDay = (y: number, m: number, d: number) => new Date(Date.UTC(y, m, d));
+
+    // One failure on 2026-07-14 — outside the local window [15..21]; must not be counted.
+    await seedOccurrence(orgAId, site, "failed", utcDay(2026, 6, 14));
+    // Three failures inside the local window (15, 16, 17); the last is the trigger.
+    await seedOccurrence(orgAId, site, "failed", utcDay(2026, 6, 15));
+    await seedOccurrence(orgAId, site, "failed", utcDay(2026, 6, 16));
+    const trigger = await seedOccurrence(orgAId, site, "failed", utcDay(2026, 6, 17));
+
+    const res = await withTenant(orgAId, (tx) =>
+      evaluateRepeatedDeviation(tx, {
+        organizationId: orgAId,
+        scheduledTaskId: site.scheduledTaskId,
+        taskTemplateId: site.templateId,
+        outletId: site.outletId,
+        triggeringOccurrenceId: trigger,
+        now: boundaryNow,
+      }),
+    );
+    const req = res.requested.find((r) => r.groupingKey === "scheduledTask+outlet");
+    expect(req).toBeDefined();
+    // Exactly the three in-window local dates — the 2026-07-14 row is outside the local window.
+    expect(req!.count).toBe(3);
   });
 
   it("does NOT count another org's failures (RLS-scoped)", async () => {

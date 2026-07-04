@@ -20,7 +20,15 @@ import { join } from "node:path";
 // an escape hatch (mirrors the F5 `keyset-guard-allow` convention).
 
 // The ONLY files allowed to flip an occurrence/exception/CA status — and only through transition().
-const SANCTIONED = ["transition.ts", "occurrences.ts", "exceptions.ts"];
+// Matched by EXACT repo-relative path (normalized to '/'), not by basename suffix: a differently
+// located file that merely shares one of these basenames (e.g. src/app/api/occurrences.ts) must NOT
+// inherit the exemption, or a real bypass there would slip past this guard.
+const SANCTIONED = ["src/lib/transition.ts", "src/lib/occurrences.ts", "src/lib/exceptions.ts"];
+
+/** Repo-relative, forward-slash-normalized path for `file` (an absolute path under process.cwd()). */
+function relPath(file: string): string {
+  return file.slice(process.cwd().length + 1).replace(/\\/g, "/");
+}
 
 interface Offender {
   file: string;
@@ -116,7 +124,7 @@ describe("F4 assertion — no status write bypasses transition()", () => {
 
     const offenders: Offender[] = [];
     for (const file of files) {
-      if (SANCTIONED.some((name) => file.endsWith(name))) continue;
+      if (SANCTIONED.includes(relPath(file))) continue;
       const code = readFileSync(file, "utf8");
       for (const line of scanSource(code)) offenders.push({ file, line });
     }
@@ -130,13 +138,13 @@ describe("F4 assertion — no status write bypasses transition()", () => {
   });
 
   it("each sanctioned service imports transition (its status writes go through F4)", () => {
-    for (const name of SANCTIONED) {
-      const code = readFileSync(join(srcRoot, "lib", name), "utf8");
+    for (const relative of SANCTIONED) {
+      const code = readFileSync(join(process.cwd(), relative), "utf8");
       // transition.ts defines transition(); the others must import it.
-      if (name === "transition.ts") {
+      if (relative.endsWith("transition.ts")) {
         expect(code).toMatch(/export\s+async\s+function\s+transition\b/);
       } else {
-        expect(code, `${name} must import transition`).toMatch(
+        expect(code, `${relative} must import transition`).toMatch(
           /import\s*\{[^}]*\btransition\b[^}]*\}\s*from\s*["']\.\/transition["']/,
         );
       }
@@ -162,6 +170,21 @@ describe("F4 assertion — no status write bypasses transition()", () => {
     // The f4-guard-allow escape hatch suppresses a flagged line.
     const allowed = `tx.taskOccurrence.update({ where: { id }, data: { status: "due" } }); // f4-guard-allow: system sweep`;
     expect(scanSource(allowed).length).toBe(0);
+  });
+
+  it("NEGATIVE fixture: a shared-basename file in a DIFFERENT location is NOT exempt", () => {
+    // A bypass living at src/app/api/occurrences.ts shares the basename of a sanctioned file but
+    // is NOT the sanctioned src/lib/occurrences.ts, so its direct status write must still be flagged.
+    const impostor = join(process.cwd(), "src", "app", "api", "occurrences.ts");
+    expect(SANCTIONED.includes(relPath(impostor))).toBe(false);
+
+    const bypass = `tx.taskOccurrence.update({ where: { id }, data: { status: "completed" } });`;
+    // The scan flags the write, and the allowlist does NOT exempt this path → it would be reported.
+    expect(scanSource(bypass).length).toBe(1);
+
+    // Sanity: the genuine sanctioned path IS exempt.
+    const genuine = join(process.cwd(), "src", "lib", "occurrences.ts");
+    expect(SANCTIONED.includes(relPath(genuine))).toBe(true);
   });
 
   it("NEGATIVE fixture: a status key OUTSIDE an update data object is NOT flagged", () => {

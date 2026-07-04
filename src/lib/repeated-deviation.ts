@@ -20,6 +20,7 @@
 // so it participates in the caller's transaction. There is no status mutation here — this is a review
 // SIGNAL, not a state change — so it does not need transition() (which pairs a status write with a log).
 
+import { DateTime } from "luxon";
 import type { TenantClient } from "./db";
 import { logActivity } from "./transition";
 
@@ -61,9 +62,23 @@ export interface EvaluateRepeatedDeviationResult {
   requested: RepeatedDeviationPayload[];
 }
 
-/** Subtract `days` whole days from `now` to get the rolling window's lower bound. */
-function windowStart(now: Date, days: number): Date {
-  return new Date(now.getTime() - days * 24 * 60 * 60 * 1000);
+/**
+ * Rolling-window lower bound as a pure LOCAL calendar date, anchored at UTC midnight so it can be
+ * compared against `occurrence_local_date` (a `@db.Date` Prisma returns as UTC midnight).
+ *
+ * The window is expressed in the OUTLET's local calendar, not in UTC-days-before-an-instant. A
+ * `days`-day rolling window that INCLUDES today is `[today_local - (days - 1), today_local]`, so we
+ * take the current local date in `timezone` and step back `days - 1` whole calendar days. Anchoring
+ * the result at UTC midnight matches how occurrence_local_date is stored (§7.1: a pure DATE), so a
+ * failure logged late in the UTC day but still "today" locally (e.g. 23:00 UTC in Europe/Berlin =
+ * 01:00 next-day local, or the reverse) lands in the correct local window rather than being dropped
+ * or double-counted around the UTC/local divide.
+ */
+function windowStartLocalDate(now: Date, days: number, timezone: string): Date {
+  const todayLocal = DateTime.fromJSDate(now, { zone: timezone }).startOf("day");
+  const lower = todayLocal.minus({ days: days - 1 });
+  // Anchor at UTC midnight of the local Y/M/D so it aligns with the @db.Date column.
+  return new Date(Date.UTC(lower.year, lower.month - 1, lower.day));
 }
 
 /**
@@ -119,8 +134,16 @@ export async function evaluateRepeatedDeviation(
 ): Promise<EvaluateRepeatedDeviationResult> {
   const requested: RepeatedDeviationPayload[] = [];
 
+  // The windows are measured on the OUTLET's local calendar. The occurrence carries the IANA zone
+  // (§7.1 snapshot), so read it from the triggering occurrence to anchor "today_local".
+  const trigger = await tx.taskOccurrence.findUniqueOrThrow({
+    where: { id: input.triggeringOccurrenceId },
+    select: { timezone: true },
+  });
+  const timezone = trigger.timezone;
+
   // --- Grouping 1: (scheduled_task_id, outlet_id) over 7 local days, threshold 3 ---
-  const stWindowFrom = windowStart(input.now, SCHEDULED_TASK_WINDOW_DAYS);
+  const stWindowFrom = windowStartLocalDate(input.now, SCHEDULED_TASK_WINDOW_DAYS, timezone);
   const stCount = await tx.taskOccurrence.count({
     where: {
       organizationId: input.organizationId,
@@ -163,7 +186,7 @@ export async function evaluateRepeatedDeviation(
   }
 
   // --- Grouping 2: (task_template_id, outlet_id) over 30 days, threshold 5 ---
-  const tplWindowFrom = windowStart(input.now, TEMPLATE_WINDOW_DAYS);
+  const tplWindowFrom = windowStartLocalDate(input.now, TEMPLATE_WINDOW_DAYS, timezone);
   const tplCount = await tx.taskOccurrence.count({
     where: {
       organizationId: input.organizationId,
