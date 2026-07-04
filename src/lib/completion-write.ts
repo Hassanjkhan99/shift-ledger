@@ -23,7 +23,7 @@
 
 import type { TenantClient } from "./db";
 import type { CompletionResult, OccurrenceStatus } from "../generated/prisma/enums";
-import type { Prisma } from "../generated/prisma/client";
+import { Prisma } from "../generated/prisma/client";
 import { buildCompletionInsert, type CompletionInsertInput } from "./completions";
 import { logActivity } from "./transition";
 
@@ -47,6 +47,12 @@ export type SubmitCompletionInput = CompletionInsertInput;
  *                                    mutated; the existing row's id is returned for observability.
  * - `conflict`                    — a DIFFERENT key targets an occurrence that already has a current
  *                                    completion. Nothing is inserted; correction is not auto-created.
+ * - `occurrence_not_found`        — the target occurrence is not visible in the current tenant (RLS-
+ *                                    scoped lookup returned null). This is a tenant guard: the global
+ *                                    current-completion unique index is on `task_occurrence_id`
+ *                                    (not org-scoped), so without this check a foreign occurrence id
+ *                                    could let this tenant write against — or block — another org's
+ *                                    occurrence. Nothing is inserted.
  */
 export type CompletionWriteResult =
   | { status: "ok"; completionId: string; idempotentReplay: boolean }
@@ -57,26 +63,36 @@ export type CompletionWriteResult =
       occurrenceId: string;
       serverStatus: string;
       existingCompletionId?: string;
-    };
+    }
+  | { status: "occurrence_not_found"; occurrenceId: string };
 
 /** The meaningful (identity-defining) fields of a submission, used for the payload-mismatch check. */
 interface MeaningfulPayload {
   taskOccurrenceId: string;
   result: CompletionResult;
   completedBy: string;
+  actorConfirmationMethod: string;
   measuredNumeric: string | null;
   enteredValues: string;
 }
 
 /**
- * Normalize a Decimal | number | string | undefined into a canonical string (or null) so that
- * `3.4`, `"3.4"`, and a Prisma.Decimal(3.4) all compare equal.
+ * Normalize a Decimal | number | string | undefined into a CANONICAL numeric string (or null) so
+ * that `3.4`, `"3.40"`, and a Prisma.Decimal(3.4) all compare equal. The stored value is read back
+ * as a Prisma.Decimal and stringified to its canonical form, so a client-supplied numeric string
+ * (`"3.40"`, `"3.0"`) must be run through the same Decimal canonicalization before comparison, or a
+ * valid exact retry is misclassified as a payload mismatch. Non-numeric strings (should not occur)
+ * fall back to the raw string so the comparison stays deterministic rather than throwing.
  */
 function normalizeMeasured(
   value: Prisma.Decimal | number | string | null | undefined,
 ): string | null {
   if (value === null || value === undefined) return null;
-  return typeof value === "string" ? value : value.toString();
+  try {
+    return new Prisma.Decimal(value).toString();
+  } catch {
+    return typeof value === "string" ? value : String(value);
+  }
 }
 
 /** Deterministic JSON serialization with sorted keys so key order never causes a false mismatch. */
@@ -93,6 +109,8 @@ function incomingMeaningful(input: SubmitCompletionInput): MeaningfulPayload {
     taskOccurrenceId: input.taskOccurrenceId,
     result: input.result,
     completedBy: input.completedBy,
+    // Defaults to 'session' when the input omits it, matching the DB column default.
+    actorConfirmationMethod: input.actorConfirmationMethod ?? "session",
     measuredNumeric: normalizeMeasured(input.measuredNumeric),
     // enteredValuesJson defaults to {} at the DB, so an absent input compares equal to a stored {}.
     enteredValues: stableStringify(input.enteredValuesJson ?? {}),
@@ -103,6 +121,7 @@ function storedMeaningful(row: {
   taskOccurrenceId: string;
   result: CompletionResult;
   completedBy: string;
+  actorConfirmationMethod: string;
   measuredNumeric: Prisma.Decimal | null;
   enteredValuesJson: Prisma.JsonValue;
 }): MeaningfulPayload {
@@ -110,6 +129,7 @@ function storedMeaningful(row: {
     taskOccurrenceId: row.taskOccurrenceId,
     result: row.result,
     completedBy: row.completedBy,
+    actorConfirmationMethod: row.actorConfirmationMethod,
     measuredNumeric: normalizeMeasured(row.measuredNumeric),
     enteredValues: stableStringify(row.enteredValuesJson ?? {}),
   };
@@ -120,6 +140,7 @@ function payloadsMatch(a: MeaningfulPayload, b: MeaningfulPayload): boolean {
     a.taskOccurrenceId === b.taskOccurrenceId &&
     a.result === b.result &&
     a.completedBy === b.completedBy &&
+    a.actorConfirmationMethod === b.actorConfirmationMethod &&
     a.measuredNumeric === b.measuredNumeric &&
     a.enteredValues === b.enteredValues
   );
@@ -131,9 +152,34 @@ const EXISTING_SELECT = {
   taskOccurrenceId: true,
   result: true,
   completedBy: true,
+  actorConfirmationMethod: true,
   measuredNumeric: true,
   enteredValuesJson: true,
 } as const;
+
+/**
+ * Read the CURRENT completion for an occurrence and, if present, shape the semantic-conflict result.
+ * Returns null when the occurrence has no current completion (the insert path is clear). Reused by
+ * both the up-front conflict check and the concurrent-race (count === 0) branch.
+ */
+async function readConflict(
+  tx: TenantClient,
+  taskOccurrenceId: string,
+): Promise<Extract<CompletionWriteResult, { status: "conflict" }> | null> {
+  const current = await tx.taskCompletion.findFirst({
+    where: { taskOccurrenceId, isCurrent: true },
+    select: { id: true, taskOccurrence: { select: { status: true } } },
+  });
+  if (!current) return null;
+  const serverStatus: OccurrenceStatus = current.taskOccurrence.status;
+  return {
+    status: "conflict",
+    reason: "current-completion-exists",
+    occurrenceId: taskOccurrenceId,
+    serverStatus,
+    existingCompletionId: current.id,
+  };
+}
 
 /**
  * Idempotent, conflict-aware completion write. Runs inside the caller's withTenant() transaction.
@@ -142,12 +188,18 @@ const EXISTING_SELECT = {
  *   1. Look up an existing row by (organizationId, clientSubmissionId).
  *        - found + same meaningful payload → idempotent replay (no write, no log).
  *        - found + different payload       → idempotency_payload_mismatch (no write, no mutation).
- *   2. No existing key. Check for a CURRENT completion on the occurrence.
+ *   2. No existing key. Verify the target occurrence is visible in THIS tenant (RLS-scoped lookup).
+ *        - not visible → occurrence_not_found. Insert nothing (tenant guard: the current-completion
+ *          unique index is global on task_occurrence_id, so a foreign id must never reach the insert).
+ *   3. Check for a CURRENT completion on the occurrence.
  *        - present → conflict (current-completion-exists). Insert nothing; do NOT auto-correct.
- *   3. Fresh write via a concurrency-safe INSERT ... ON CONFLICT DO NOTHING (createMany +
- *      skipDuplicates). If count === 0, a concurrent submit with the same key won the race → SELECT
- *      that row and return it as an idempotent replay (no duplicate log). On a genuine insert, write
- *      exactly ONE activity_log entry (completion.created) atomically in the same tx.
+ *   4. Fresh write via a concurrency-safe INSERT ... ON CONFLICT DO NOTHING (createMany +
+ *      skipDuplicates). On a genuine insert (count === 1), write exactly ONE activity_log entry
+ *      (completion.created) atomically in the same tx. If count === 0 a concurrent submit won a race:
+ *        - our key already has a row → same-key replay: compare payloads and return ok, or
+ *          idempotency_payload_mismatch if the winning row's payload differs.
+ *        - no row under our key      → a DIFFERENT key won the occurrence's current-completion slot →
+ *          re-read the current completion and return the semantic conflict result. Never throw.
  */
 export async function submitCompletion(
   tx: TenantClient,
@@ -170,23 +222,23 @@ export async function submitCompletion(
       : { status: "idempotency_payload_mismatch", completionId: existing.id };
   }
 
-  // 2. Different key, but the occurrence may already have a current completion → semantic conflict.
-  const current = await tx.taskCompletion.findFirst({
-    where: { taskOccurrenceId: input.taskOccurrenceId, isCurrent: true },
-    select: { id: true, taskOccurrence: { select: { status: true } } },
+  // 2. Tenant guard. The current-completion unique index is GLOBAL on task_occurrence_id (not
+  //    org-scoped), so a cross-tenant occurrence id would otherwise let this org write against — or
+  //    block — another org's occurrence. RLS scopes `tx` to this org, so a foreign occurrence returns
+  //    null here; reject before any insert path.
+  const occurrence = await tx.taskOccurrence.findUnique({
+    where: { id: input.taskOccurrenceId },
+    select: { id: true },
   });
-  if (current) {
-    const serverStatus: OccurrenceStatus = current.taskOccurrence.status;
-    return {
-      status: "conflict",
-      reason: "current-completion-exists",
-      occurrenceId: input.taskOccurrenceId,
-      serverStatus,
-      existingCompletionId: current.id,
-    };
+  if (!occurrence) {
+    return { status: "occurrence_not_found", occurrenceId: input.taskOccurrenceId };
   }
 
-  // 3. Fresh write. createMany + skipDuplicates → INSERT ... ON CONFLICT DO NOTHING, so a concurrent
+  // 3. Different key, but the occurrence may already have a current completion → semantic conflict.
+  const conflict = await readConflict(tx, input.taskOccurrenceId);
+  if (conflict) return conflict;
+
+  // 4. Fresh write. createMany + skipDuplicates → INSERT ... ON CONFLICT DO NOTHING, so a concurrent
   //    submit with the same key cannot surface a unique-violation to the caller.
   const inserted = await tx.taskCompletion.createMany({
     data: [buildCompletionInsert(input)],
@@ -194,21 +246,37 @@ export async function submitCompletion(
   });
 
   if (inserted.count === 0) {
-    // A concurrent submit with the same key won the race. Read it back and treat as a replay — no
-    // second row, no second activity_log entry.
-    const winner = await tx.taskCompletion.findUniqueOrThrow({
+    // A concurrent submit won a race that skipped our insert. Two distinct causes:
+    const winner = await tx.taskCompletion.findUnique({
       where: {
         organizationId_clientSubmissionId: {
           organizationId: input.organizationId,
           clientSubmissionId: input.clientSubmissionId,
         },
       },
-      select: { id: true },
+      select: EXISTING_SELECT,
     });
-    return { status: "ok", completionId: winner.id, idempotentReplay: true };
+    if (winner) {
+      // (a) our OWN key won (a concurrent submit with the same key beat us). Same-key replay:
+      //     compare payloads so a concurrent DIFFERENT-payload submit is still flagged, not blindly ok.
+      return payloadsMatch(incomingMeaningful(input), storedMeaningful(winner))
+        ? { status: "ok", completionId: winner.id, idempotentReplay: true }
+        : { status: "idempotency_payload_mismatch", completionId: winner.id };
+    }
+    // (b) a DIFFERENT key won the occurrence's current-completion slot (partial unique on
+    //     task_occurrence_id WHERE is_current). No row under our key → semantic conflict, never throw.
+    const raced = await readConflict(tx, input.taskOccurrenceId);
+    if (raced) return raced;
+    // A skipped insert is always caused by one of those two unique indexes, so one of the branches
+    // above returns. Guard the type system (and any future index change) with an explicit throw
+    // rather than logging a creation we never performed.
+    throw new Error(
+      `submitCompletion: insert skipped for occurrence ${input.taskOccurrenceId} but neither the same-key row nor a current completion is visible`,
+    );
   }
 
-  // Read back the id of the row we just created (createMany does not return it).
+  // Genuine insert (count === 1). Read back the id of the row we just created (createMany does not
+  // return it) and write exactly one creation audit entry.
   const created = await tx.taskCompletion.findUniqueOrThrow({
     where: {
       organizationId_clientSubmissionId: {

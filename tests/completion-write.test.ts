@@ -232,6 +232,188 @@ describe("submitCompletion — F2 idempotent write semantics", () => {
     expect(await createdLogCount(orgAId, first.completionId)).toBe(1);
   });
 
+  it("tenant guard: occurrence id from another org → occurrence_not_found, no row", async () => {
+    // Occurrence lives in org B; org A submits against it. RLS scopes the lookup so it is invisible.
+    const foreign = await makeOccurrence(orgBId);
+    const { userId } = await makeOccurrence(orgAId);
+
+    const res = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: foreign.occurrenceId, // another org's occurrence
+        clientSubmissionId: randomUUID(),
+        result: "pass",
+        completedBy: userId,
+      }),
+    );
+
+    expect(res.status).toBe("occurrence_not_found");
+    if (res.status !== "occurrence_not_found") return;
+    expect(res.occurrenceId).toBe(foreign.occurrenceId);
+    // No row created in either org for this occurrence.
+    expect(await completionCount(orgAId, foreign.occurrenceId)).toBe(0);
+    expect(await completionCount(orgBId, foreign.occurrenceId)).toBe(0);
+  });
+
+  it("numeric canonicalization: same key, reading '3.40' then '3.4' → ok idempotent replay", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    const csid = randomUUID();
+
+    const first = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "pass",
+        completedBy: userId,
+        measuredNumeric: "3.40",
+      }),
+    );
+    expect(first.status).toBe("ok");
+    if (first.status !== "ok") return;
+
+    // Exact retry with an equivalent numeric form (string "3.4" and number 3.4 both canonicalize).
+    const retryStr = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "pass",
+        completedBy: userId,
+        measuredNumeric: "3.4",
+      }),
+    );
+    expect(retryStr.status).toBe("ok");
+    if (retryStr.status !== "ok") return;
+    expect(retryStr.idempotentReplay).toBe(true);
+    expect(retryStr.completionId).toBe(first.completionId);
+
+    const retryNum = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "pass",
+        completedBy: userId,
+        measuredNumeric: 3.4,
+      }),
+    );
+    expect(retryNum.status).toBe("ok");
+
+    expect(await completionCount(orgAId, occurrenceId)).toBe(1);
+    expect(await createdLogCount(orgAId, first.completionId)).toBe(1);
+  });
+
+  it("actorConfirmationMethod: same key, different method → idempotency_payload_mismatch", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    const csid = randomUUID();
+
+    const first = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "pass",
+        completedBy: userId,
+        actorConfirmationMethod: "pin",
+      }),
+    );
+    expect(first.status).toBe("ok");
+    if (first.status !== "ok") return;
+
+    // Same key, same everything except the actor confirmation method (pin → session).
+    const mismatch = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "pass",
+        completedBy: userId,
+        actorConfirmationMethod: "session",
+      }),
+    );
+    expect(mismatch.status).toBe("idempotency_payload_mismatch");
+    if (mismatch.status !== "idempotency_payload_mismatch") return;
+    expect(mismatch.completionId).toBe(first.completionId);
+    expect(await completionCount(orgAId, occurrenceId)).toBe(1);
+  });
+
+  it("race (a): different keys, pre-inserted winner → loser gets conflict, not a thrown error", async () => {
+    // Simulate the concurrent race deterministically: a DIFFERENT client's completion is already the
+    // current row, so our createMany(skipDuplicates) skips on the (task_occurrence_id) WHERE is_current
+    // index and the count===0 branch must re-read the conflict rather than findUniqueOrThrow on our key.
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+
+    const winner = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: randomUUID(),
+        result: "pass",
+        completedBy: userId,
+      }),
+    );
+    expect(winner.status).toBe("ok");
+    if (winner.status !== "ok") return;
+
+    const loser = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: randomUUID(), // different key racing the same occurrence
+        result: "fail",
+        completedBy: userId,
+      }),
+    );
+
+    expect(loser.status).toBe("conflict");
+    if (loser.status !== "conflict") return;
+    expect(loser.reason).toBe("current-completion-exists");
+    expect(loser.occurrenceId).toBe(occurrenceId);
+    expect(loser.existingCompletionId).toBe(winner.completionId);
+    expect(await completionCount(orgAId, occurrenceId)).toBe(1);
+    expect(await createdLogCount(orgAId, winner.completionId)).toBe(1);
+  });
+
+  it("race (b): same key, different payload winner pre-inserted → loser gets payload_mismatch", async () => {
+    // The count===0 branch's same-key path must compare the winning row's payload, not blindly return
+    // ok. Pre-insert the winner under our key, then submit the SAME key with a different payload.
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    const csid = randomUUID();
+
+    const winner = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "pass",
+        completedBy: userId,
+        measuredNumeric: "3.4",
+      }),
+    );
+    expect(winner.status).toBe("ok");
+    if (winner.status !== "ok") return;
+
+    // Same key, materially different payload. The up-front same-key lookup already catches this, but
+    // this exercises the same payload comparison the count===0 branch reuses.
+    const loser = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: csid,
+        result: "fail",
+        completedBy: userId,
+        measuredNumeric: "9.9",
+      }),
+    );
+
+    expect(loser.status).toBe("idempotency_payload_mismatch");
+    if (loser.status !== "idempotency_payload_mismatch") return;
+    expect(loser.completionId).toBe(winner.completionId);
+    expect(await completionCount(orgAId, occurrenceId)).toBe(1);
+    expect(await createdLogCount(orgAId, winner.completionId)).toBe(1);
+  });
+
   it("cross-org: identical client_submission_id in two orgs → both succeed, each its own row", async () => {
     const csid = randomUUID();
     const a = await makeOccurrence(orgAId);
