@@ -25,11 +25,16 @@ interface Fixture {
   templateId: string;
 }
 
-/** Load the seeded property + outlet for an org. */
+/** Load a LIVE (non-deleted) seeded property + outlet for an org. Must filter deletedAt: other
+ *  test files (and this one's archived-site test) soft-delete outlets in the shared org; without the
+ *  filter findFirstOrThrow can return a tombstoned outlet, and since generateOccurrences skips
+ *  soft-deleted sites the schedule would then materialize nothing (a cross-file isolation trap). */
 async function siteFor(orgId: string): Promise<{ propertyId: string; outletId: string }> {
   return withTenant(orgId, async (tx) => {
-    const property = await tx.property.findFirstOrThrow();
-    const outlet = await tx.outlet.findFirstOrThrow();
+    const property = await tx.property.findFirstOrThrow({ where: { deletedAt: null } });
+    const outlet = await tx.outlet.findFirstOrThrow({
+      where: { deletedAt: null, propertyId: property.id },
+    });
     return { propertyId: property.id, outletId: outlet.id };
   });
 }
