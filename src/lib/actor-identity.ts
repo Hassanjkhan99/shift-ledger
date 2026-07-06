@@ -123,6 +123,16 @@ export async function resolveCompletionActor(
       return { actorUserId: input.sessionUserId, method: "session" };
 
     case "pin": {
+      // Check pick-eligibility BEFORE the side-effecting PIN verifier. verifyActorPin increments
+      // failed_attempts and can lock the account out on wrong guesses; if we verified first, knowing
+      // any member's id would let this tablet lock out a user who was never in its pick list. So
+      // reject an ineligible/foreign picked user (outlet scope + completion-capable role) up front —
+      // no PIN attempt is recorded against them.
+      if (
+        !(await isEligiblePickUser(tx, { outletId: input.outletId, userId: input.pickedUserId }))
+      ) {
+        throw new IneligiblePickUserError(input.pickedUserId, input.outletId);
+      }
       const result = await verifyActorPin(tx, {
         organizationId: input.organizationId,
         userId: input.pickedUserId,
@@ -131,13 +141,6 @@ export async function resolveCompletionActor(
       });
       if (!result.ok) {
         throw new ActorPinError(result.reason);
-      }
-      // verifyActorPin proved active membership but not the outlet scope + completion-capable role
-      // (it does not know the outlet), so layer the pick-eligibility check on top.
-      if (
-        !(await isEligiblePickUser(tx, { outletId: input.outletId, userId: result.actorUserId }))
-      ) {
-        throw new IneligiblePickUserError(result.actorUserId, input.outletId);
       }
       return { actorUserId: result.actorUserId, method: "pin" };
     }
@@ -172,8 +175,12 @@ const SCOPED_CORRECTION_ROLES: readonly OrgRole[] = [
 
 export interface CorrectionActor {
   role: OrgRole;
-  /** Empty = whole-org scope; else limited to these property ids (Membership.propertyScope). */
-  propertyScope: string[];
+  /**
+   * Empty/NULL = whole-org scope; else limited to these property ids (Membership.propertyScope).
+   * NULL is accepted because the DB column is nullable (init migration) even though Prisma defaults
+   * inserts to `[]`; it is normalized to whole-org, matching the pick-list predicate.
+   */
+  propertyScope: string[] | null;
 }
 
 export interface CorrectionTarget {
@@ -194,7 +201,8 @@ export function mayCreateCorrection(actor: CorrectionActor, target: CorrectionTa
     return true;
   }
   if (SCOPED_CORRECTION_ROLES.includes(actor.role)) {
-    return actor.propertyScope.length === 0 || actor.propertyScope.includes(target.propertyId);
+    const scope = actor.propertyScope ?? []; // NULL scope = whole-org
+    return scope.length === 0 || scope.includes(target.propertyId);
   }
   return false;
 }

@@ -4,16 +4,15 @@
 -- allowed domain lives here: the method must be one of the three shared-tablet actor-identity
 -- values. Mirrored at the app boundary by assertValidConfirmationMethod() in src/lib/actor-identity.ts.
 
--- Add the constraint NOT VALID first, then VALIDATE it in a separate statement. The column
--- previously accepted arbitrary text (text NOT NULL DEFAULT 'session'), so an environment with
--- pre-existing task_completions rows could hold a legacy out-of-domain value. A plain ADD CONSTRAINT
--- validates every historical row at deploy and aborts on a single legacy typo. NOT VALID enforces
--- the CHECK only for NEW/updated rows (letting existing data be remediated independently), and the
--- subsequent VALIDATE CONSTRAINT then verifies the existing rows without blocking the schema change.
--- The test DB is ephemeral, so both statements run clean here; the split matters for real deploys.
+-- Add the constraint NOT VALID and DO NOT validate here. The column previously accepted arbitrary
+-- text (text NOT NULL DEFAULT 'session'), so an environment with pre-existing task_completions rows
+-- could hold a legacy out-of-domain value; a plain ADD CONSTRAINT — or a VALIDATE in this same
+-- migration — would scan every historical row at deploy and abort on a single legacy typo. NOT VALID
+-- enforces the CHECK for all NEW/updated rows immediately (which is all we need going forward) while
+-- leaving existing rows unscanned. Validating the backlog is intentionally deferred: a later
+-- data-cleanup migration maps/removes any legacy value and only then runs
+-- `VALIDATE CONSTRAINT "task_completions_actor_confirmation_method_check"`. (No such legacy data
+-- exists yet — the table is new — but keeping it NOT VALID makes the deploy safe regardless.)
 ALTER TABLE "task_completions"
   ADD CONSTRAINT "task_completions_actor_confirmation_method_check"
   CHECK ("actor_confirmation_method" IN ('session', 'pin', 'initials')) NOT VALID;
-
-ALTER TABLE "task_completions"
-  VALIDATE CONSTRAINT "task_completions_actor_confirmation_method_check";

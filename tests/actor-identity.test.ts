@@ -53,10 +53,16 @@ async function makeMember(
   });
 }
 
-/** The seeded outlet + its property for an org (seed creates exactly one of each). */
+/** A LIVE (non-deleted) seeded outlet + its property for an org. Must filter deletedAt: other test
+ *  files soft-delete outlets in the shared org, and isEligiblePickUser fails closed on a deleted
+ *  outlet — without the filter findFirstOrThrow could hand back a tombstoned outlet and the eligible
+ *  picked-user happy paths would wrongly be rejected. */
 async function seededOutlet(orgId: string): Promise<{ outletId: string; propertyId: string }> {
   return withTenant(orgId, async (tx) => {
-    const outlet = await tx.outlet.findFirstOrThrow({ select: { id: true, propertyId: true } });
+    const outlet = await tx.outlet.findFirstOrThrow({
+      where: { deletedAt: null, property: { deletedAt: null } },
+      select: { id: true, propertyId: true },
+    });
     return { outletId: outlet.id, propertyId: outlet.propertyId };
   });
 }
@@ -208,6 +214,33 @@ describe("resolveCompletionActor", () => {
     ).rejects.toBeInstanceOf(IneligiblePickUserError);
   });
 
+  it("pin: an ineligible picked user is rejected BEFORE any PIN attempt is recorded (no lockout griefing)", async () => {
+    const { outletId } = await seededOutlet(orgAId);
+    // Out-of-scope member with a PIN set; a WRONG pin is supplied. Eligibility is checked first, so
+    // the PIN verifier never runs and no failed attempt is recorded against the user.
+    const { userId } = await makeMember(orgAId, { propertyScope: [randomUUID()] });
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "1234" }),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        resolveCompletionActor(tx, {
+          method: "pin",
+          organizationId: orgAId,
+          outletId,
+          pickedUserId: userId,
+          pin: "0000", // wrong — but eligibility should reject before this is checked
+          now: new Date(),
+        }),
+      ),
+    ).rejects.toBeInstanceOf(IneligiblePickUserError);
+
+    const pin = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findFirst({ where: { userId }, select: { failedAttempts: true } }),
+    );
+    expect(pin?.failedAttempts).toBe(0); // the PIN verifier never ran
+  });
+
   it("initials: non-empty initials + an eligible picked user return the picked user + method 'initials'", async () => {
     const { outletId } = await seededOutlet(orgAId);
     const { userId } = await makeMember(orgAId);
@@ -294,6 +327,11 @@ describe("assertMayCreateCorrection / mayCreateCorrection", () => {
     permit({ role: OrgRole.PropertyManager, propertyScope: [targetProperty] });
     permit({ role: OrgRole.KitchenManager, propertyScope: [] });
     permit({ role: OrgRole.KitchenManager, propertyScope: [targetProperty, otherProperty] });
+  });
+
+  it("treats a NULL property_scope as whole-org for scoped managers (nullable DB column)", () => {
+    permit({ role: OrgRole.PropertyManager, propertyScope: null });
+    permit({ role: OrgRole.KitchenManager, propertyScope: null });
   });
 
   it("denies PropertyManager/KitchenManager whose scope excludes the target property (§6.3)", () => {
