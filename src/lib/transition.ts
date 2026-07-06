@@ -94,6 +94,15 @@ export interface TransitionOptions<T> {
   requireReason?: boolean;
   /** The status/version mutation. Runs inside the same `tx` as the audit insert. */
   mutate: (tx: TenantClient) => Promise<T>;
+  /**
+   * Optional guard evaluated on the `mutate` result. When it returns false, transition() treats
+   * the mutation as a no-op and writes NO activity_log row (returning the result unchanged). Used
+   * for compare-and-set writes (e.g. the overdue sweep's `updateMany({ where: { id, status } })`):
+   * if a concurrent completion/skip/cancel changed the row between the sweep's read and write, the
+   * CAS updates 0 rows and we must NOT emit a spurious transition log. Omit for a normal write,
+   * where the mutation is assumed to always apply.
+   */
+  didMutate?: (result: T) => boolean;
 }
 
 function isBlank(value: string | undefined): boolean {
@@ -140,6 +149,12 @@ export async function transition<T>(tx: TenantClient, opts: TransitionOptions<T>
   }
 
   const result = await opts.mutate(tx);
+
+  // Compare-and-set no-op: the mutation matched nothing (a concurrent write changed the row).
+  // Skip the audit row entirely — there was no transition to record.
+  if (opts.didMutate && !opts.didMutate(result)) {
+    return result;
+  }
 
   await logActivity(tx, {
     organizationId: opts.organizationId,

@@ -40,6 +40,53 @@ enum InvitationStatus {
   @@map("invitation_status")
 }
 
+// ---- Occurrence-domain enums (#8; §8.0 / §8.11-§8.13) ---------------------------
+
+enum CheckType {
+  temperature
+  cleaning
+  allergen
+  opening
+  closing
+  generic
+
+  @@map("check_type")
+}
+
+enum EvidenceType {
+  note
+  photo
+  temperature
+  checkbox
+  initials
+  signature
+  file
+
+  @@map("evidence_type")
+}
+
+enum RecurrenceFreq {
+  daily
+  weekly
+  monthly
+
+  @@map("recurrence_freq")
+}
+
+// Canonical per D1/F8 (§7.1). The §9.3 prose table's `scheduled` is drift — `pending` is correct.
+enum OccurrenceStatus {
+  pending
+  due
+  overdue
+  completed
+  completed_late
+  failed
+  skipped
+  cancelled
+
+  @@map("occurrence_status")
+}
+
 enum ActivitySubjectType {
   organization
   property
@@ -76,6 +123,9 @@ model User {
   memberships     Membership[]
   invitationsSent Invitation[] @relation("InvitedBy")
 
+  scheduledTasks  ScheduledTask[]  @relation("ScheduledTaskAssignee")
+  taskOccurrences TaskOccurrence[] @relation("TaskOccurrenceAssignee")
+
   @@map("users")
 }
 
@@ -93,11 +143,14 @@ model Organization {
   updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
   deletedAt       DateTime? @map("deleted_at") @db.Timestamptz(6)
 
-  memberships  Membership[]
-  invitations  Invitation[]
-  properties   Property[]
-  outlets      Outlet[]
-  activityLogs ActivityLog[]
+  memberships     Membership[]
+  invitations     Invitation[]
+  properties      Property[]
+  outlets         Outlet[]
+  activityLogs    ActivityLog[]
+  taskTemplates   TaskTemplate[]
+  scheduledTasks  ScheduledTask[]
+  taskOccurrences TaskOccurrence[]
 
   @@map("organizations")
 }
@@ -158,8 +211,10 @@ model Property {
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
   deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(6)
 
-  organization Organization @relation(fields: [organizationId], references: [id])
-  outlets      Outlet[]
+  organization    Organization     @relation(fields: [organizationId], references: [id])
+  outlets         Outlet[]
+  scheduledTasks  ScheduledTask[]
+  taskOccurrences TaskOccurrence[]
 
   @@unique([organizationId, name])
   @@index([organizationId, deletedAt])
@@ -175,8 +230,10 @@ model Outlet {
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
   deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(6)
 
-  organization Organization @relation(fields: [organizationId], references: [id])
-  property     Property     @relation(fields: [propertyId], references: [id])
+  organization    Organization     @relation(fields: [organizationId], references: [id])
+  property        Property         @relation(fields: [propertyId], references: [id])
+  scheduledTasks  ScheduledTask[]
+  taskOccurrences TaskOccurrence[]
 
   @@unique([propertyId, name])
   @@index([organizationId, propertyId, deletedAt])
@@ -208,4 +265,104 @@ model ActivityLog {
   // `WHERE organization_id = ? ORDER BY seq DESC` without a sort. (#55)
   @@index([organizationId, seq])
   @@map("activity_log")
+}
+
+// ---- Occurrence domain (#8; §8.11-§8.13) ----------------------------------------
+// Mutable tenant-scoped tables (soft-delete via deleted_at). RLS + FORCE + tenant_isolation
+// policy applied via raw SQL in the occurrence_domain migration. NOT append-only (no reject
+// trigger) — unlike activity_log / task_completions. template_library (source_library_id) is
+// a later-milestone table, so source_library_id is a plain nullable UUID column with no FK yet.
+
+model TaskTemplate {
+  id               String        @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId   String        @map("organization_id") @db.Uuid
+  sourceLibraryId  String?       @map("source_library_id") @db.Uuid
+  checkType        CheckType     @map("check_type")
+  title            String
+  titleI18n        Json?         @map("title_i18n")
+  instructions     String?
+  requiredEvidence EvidenceType[] @default([]) @map("required_evidence")
+  targetConfigJson Json?         @map("target_config_json")
+  isActive         Boolean       @default(true) @map("is_active")
+  createdAt        DateTime      @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt        DateTime      @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt        DateTime?     @map("deleted_at") @db.Timestamptz(6)
+
+  organization    Organization     @relation(fields: [organizationId], references: [id])
+  scheduledTasks  ScheduledTask[]
+  taskOccurrences TaskOccurrence[]
+
+  @@index([organizationId, isActive, deletedAt])
+  @@index([organizationId, checkType])
+  @@map("task_templates")
+}
+
+model ScheduledTask {
+  id             String         @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String         @map("organization_id") @db.Uuid
+  propertyId     String         @map("property_id") @db.Uuid
+  outletId       String         @map("outlet_id") @db.Uuid
+  taskTemplateId String         @map("task_template_id") @db.Uuid
+  recurrenceJson Json           @map("recurrence_json")
+  recurrenceFreq RecurrenceFreq @map("recurrence_freq")
+  timeOfDay      DateTime       @map("time_of_day") @db.Time(6)
+  timezone       String
+  assigneeRole   OrgRole?       @map("assignee_role")
+  assigneeUserId String?        @map("assignee_user_id") @db.Uuid
+  graceMinutes   Int            @default(15) @map("grace_minutes")
+  startsOn       DateTime       @map("starts_on") @db.Date
+  endsOn         DateTime?      @map("ends_on") @db.Date
+  isActive       Boolean        @default(true) @map("is_active")
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime       @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt      DateTime?      @map("deleted_at") @db.Timestamptz(6)
+
+  organization    Organization     @relation(fields: [organizationId], references: [id])
+  property        Property         @relation(fields: [propertyId], references: [id])
+  outlet          Outlet           @relation(fields: [outletId], references: [id])
+  taskTemplate    TaskTemplate     @relation(fields: [taskTemplateId], references: [id])
+  assigneeUser    User?            @relation("ScheduledTaskAssignee", fields: [assigneeUserId], references: [id])
+  taskOccurrences TaskOccurrence[]
+
+  @@index([organizationId, isActive, deletedAt])
+  @@index([organizationId, outletId, isActive])
+  @@index([isActive, endsOn])
+  @@map("scheduled_tasks")
+}
+
+model TaskOccurrence {
+  id                  String           @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId      String           @map("organization_id") @db.Uuid
+  propertyId          String           @map("property_id") @db.Uuid
+  outletId            String           @map("outlet_id") @db.Uuid
+  scheduledTaskId     String           @map("scheduled_task_id") @db.Uuid
+  taskTemplateId      String           @map("task_template_id") @db.Uuid
+  checkType           CheckType        @map("check_type")
+  occurrenceLocalDate DateTime         @map("occurrence_local_date") @db.Date
+  dueAt               DateTime         @map("due_at") @db.Timestamptz(6)
+  timezone            String
+  status              OccurrenceStatus @default(pending)
+  assigneeRole        OrgRole?         @map("assignee_role")
+  assigneeUserId      String?          @map("assignee_user_id") @db.Uuid
+  completedAt         DateTime?        @map("completed_at") @db.Timestamptz(6)
+  createdAt           DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt           DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
+  deletedAt           DateTime?        @map("deleted_at") @db.Timestamptz(6)
+
+  organization  Organization  @relation(fields: [organizationId], references: [id])
+  property      Property      @relation(fields: [propertyId], references: [id])
+  outlet        Outlet        @relation(fields: [outletId], references: [id])
+  scheduledTask ScheduledTask @relation(fields: [scheduledTaskId], references: [id])
+  taskTemplate  TaskTemplate  @relation(fields: [taskTemplateId], references: [id])
+  assigneeUser  User?         @relation("TaskOccurrenceAssignee", fields: [assigneeUserId], references: [id])
+
+  @@unique([scheduledTaskId, occurrenceLocalDate])
+  @@index([organizationId, propertyId, outletId, occurrenceLocalDate, status])
+  // The overdue-sweep index is PARTIAL — (status, due_at) WHERE status IN ('pending','due') —
+  // and lives only in the occurrence_domain migration (Prisma cannot express a partial index).
+  // Do NOT add a full @@index([status, dueAt]) here: it would be a second, unbounded index and
+  // would make `prisma migrate diff` report drift against the intentional partial index.
+  @@index([organizationId, assigneeUserId, occurrenceLocalDate])
+  @@index([organizationId, status, occurrenceLocalDate])
+  @@map("task_occurrences")
 }
