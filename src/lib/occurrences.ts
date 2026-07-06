@@ -398,6 +398,7 @@ async function generateForSchedule(
     // Idempotent create-if-absent. Prisma's createMany with skipDuplicates maps to
     // INSERT ... ON CONFLICT DO NOTHING; count===0 means the row already existed (never reset it).
     const result = await tx.taskOccurrence.createMany({
+      // f4-guard-allow: (none)→pending create; the freshly-inserted row is audited via logActivity below
       data: [
         {
           organizationId: schedule.organizationId,

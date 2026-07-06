@@ -515,4 +515,34 @@ describe("evaluateRepeatedDeviation", () => {
     );
     expect(count).toBe(0); // no request logged — the tombstoned failure did not count
   });
+
+  it("does NOT count a FUTURE-dated failed occurrence (local date after today) toward the threshold", async () => {
+    const site = await makeSite(orgAId);
+    // Two live in-window failures (days 0,1 = 2026-07-14, 15) — one short of the threshold of 3.
+    await seedFailures(orgAId, site, 2, 0);
+    // A third failure dated AFTER `now`'s local today (2026-07-20): 2026-07-25 is inside the LOWER
+    // bound but ahead of today_local. Without the `lte` upper bound this future/backfilled row would
+    // tip the (scheduled_task+outlet) window to 3 and WRONGLY fire; bounded, the window stays at 2.
+    const future = await seedOccurrence(orgAId, site, "failed", new Date(Date.UTC(2026, 6, 25)));
+
+    const res = await withTenant(orgAId, (tx) =>
+      evaluateRepeatedDeviation(tx, {
+        organizationId: orgAId,
+        scheduledTaskId: site.scheduledTaskId,
+        taskTemplateId: site.templateId,
+        outletId: site.outletId,
+        triggeringOccurrenceId: future,
+        now,
+      }),
+    );
+    // Only 2 failures are within [window start .. today_local]; the future row is out of scope.
+    expect(res.requested.find((r) => r.groupingKey === "scheduledTask+outlet")).toBeUndefined();
+
+    const count = await withTenant(orgAId, (tx) =>
+      tx.activityLog.count({
+        where: { action: "review.repeated_deviation_requested", subjectId: future },
+      }),
+    );
+    expect(count).toBe(0); // no request logged — the future-dated failure did not count
+  });
 });

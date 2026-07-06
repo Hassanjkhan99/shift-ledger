@@ -127,6 +127,7 @@ export async function openException(
     reason: actor.reason,
     mutate: async (t: TenantClient) => {
       const row = await t.exception.create({
+        // f4-guard-allow: (none)→open create routed through transition() (opts.subjectId set below)
         data: {
           organizationId: input.organizationId,
           propertyId: input.propertyId,
@@ -343,6 +344,7 @@ export async function createCorrectiveAction(
     reason: actor.reason,
     mutate: async (t: TenantClient) => {
       const row = await t.correctiveAction.create({
+        // f4-guard-allow: (none)→open create routed through transition() (opts.subjectId set below)
         data: {
           organizationId: parent.organizationId,
           exceptionId: input.exceptionId,
