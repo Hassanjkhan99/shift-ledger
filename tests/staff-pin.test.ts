@@ -304,6 +304,87 @@ describe("lockout after repeated failures", () => {
     expect(stillLocked.lockedUntil?.getTime()).toBe(firstLockedUntil?.getTime());
   });
 
+  it("re-lock after expiry: an expired lock starts a fresh window; a wrong attempt is treated fresh and re-locks after MAX, writing a SECOND audit row; a correct pin resets", async () => {
+    // Regression for the security bug where, after a lockout EXPIRES, failedAttempts stayed at MAX so
+    // the `=== MAX` crossing never matched again and the account was never re-locked (unlimited
+    // guessing after waiting out one lockout).
+    const { userId } = await makeMember(orgAId);
+    const t0 = new Date("2026-07-06T10:00:00Z");
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "5555" }),
+    );
+
+    // (a) MAX wrong attempts lock out and write exactly one lockout audit row.
+    for (let i = 0; i < MAX_FAILED_ATTEMPTS; i++) {
+      await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now: t0 }),
+      );
+    }
+    let logs = await withTenant(orgAId, (tx) =>
+      tx.activityLog.findMany({ where: { subjectId: userId, action: "actor.pin_lockout" } }),
+    );
+    expect(logs).toHaveLength(1);
+
+    // (b) After the lock expires, a WRONG attempt is treated FRESH: failedAttempts becomes 1 (not 6)
+    //     and the account is NOT immediately re-locked.
+    const afterExpiry = new Date(t0.getTime() + (LOCKOUT_MINUTES + 1) * 60_000);
+    const firstFresh = await withTenant(orgAId, (tx) =>
+      verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now: afterExpiry }),
+    );
+    expect(firstFresh.ok).toBe(false);
+    if (!firstFresh.ok) expect(firstFresh.reason).toBe("wrong_pin");
+    const row = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    expect(row.failedAttempts).toBe(1);
+    expect(row.lockedUntil).toBeNull();
+
+    // (c) MAX-1 more fresh wrong attempts (total MAX after expiry) RE-LOCK and write a SECOND audit row.
+    let last;
+    for (let i = 1; i < MAX_FAILED_ATTEMPTS; i++) {
+      last = await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now: afterExpiry }),
+      );
+    }
+    expect(last!.ok).toBe(false);
+    if (!last!.ok) expect(last!.reason).toBe("locked_out");
+    logs = await withTenant(orgAId, (tx) =>
+      tx.activityLog.findMany({ where: { subjectId: userId, action: "actor.pin_lockout" } }),
+    );
+    expect(logs).toHaveLength(2);
+  });
+
+  it("correct pin after an expired lock succeeds and resets the counter (no re-lock)", async () => {
+    const { userId } = await makeMember(orgAId);
+    const t0 = new Date("2026-07-06T12:00:00Z");
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "4242" }),
+    );
+
+    for (let i = 0; i < MAX_FAILED_ATTEMPTS; i++) {
+      await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now: t0 }),
+      );
+    }
+
+    // After expiry, the CORRECT pin succeeds and resets the counter + clears the (stale) lock.
+    const afterExpiry = new Date(t0.getTime() + (LOCKOUT_MINUTES + 1) * 60_000);
+    const ok = await withTenant(orgAId, (tx) =>
+      verifyActorPin(tx, { organizationId: orgAId, userId, pin: "4242", now: afterExpiry }),
+    );
+    expect(ok).toEqual({ ok: true, actorUserId: userId });
+
+    const row = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    expect(row.failedAttempts).toBe(0);
+    expect(row.lockedUntil).toBeNull();
+  });
+
   it("counter regression: each wrong attempt increments by exactly one and locks out at exactly MAX", async () => {
     const { userId } = await makeMember(orgAId);
     const now = new Date("2026-07-04T09:00:00Z");
