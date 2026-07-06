@@ -47,6 +47,17 @@ enum ActivitySubjectType {
   membership
   invitation
   user
+  // Full §8.20 subject set. Added ahead of their tables so transition() is generic across
+  // every entity; the corresponding domain tables land in later milestones (#8/#9/#10/etc.).
+  taskTemplate     @map("task_template")
+  scheduledTask    @map("scheduled_task")
+  taskOccurrence   @map("task_occurrence")
+  taskCompletion   @map("task_completion")
+  evidence         @map("evidence")
+  exception        @map("exception")
+  correctiveAction @map("corrective_action")
+  exportJob        @map("export_job")
+  notification     @map("notification")
 
   @@map("activity_subject_type")
 }
