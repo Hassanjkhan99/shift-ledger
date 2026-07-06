@@ -402,7 +402,8 @@ model TaskCompletion {
   completedBy             String           @map("completed_by") @db.Uuid
   actorConfirmationMethod String           @default("session") @map("actor_confirmation_method")
   /// F3 compliance timestamp. Server-authoritative: a BEFORE INSERT trigger unconditionally overwrites
-  /// any supplied value with now(), so the client can never drive it (the @default is belt-and-braces).
+  /// any supplied value with clock_timestamp() (real wall-clock, not tx-start now()), so the client can
+  /// never drive it and every insert gets a distinct instant (the @default is belt-and-braces).
   recordedAt              DateTime         @default(now()) @map("recorded_at") @db.Timestamptz(6)
   clientReportedAt        DateTime?        @map("client_reported_at") @db.Timestamptz(6)
   deviceMetaJson          Json?            @map("device_meta_json")

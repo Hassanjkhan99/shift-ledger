@@ -44,10 +44,15 @@ CREATE TABLE "task_completions" (
     CONSTRAINT "task_completions_pkey" PRIMARY KEY ("id"),
     -- version is 1-based and monotonic; a non-positive version is meaningless (P2).
     CONSTRAINT "task_completions_version_positive" CHECK ("version" >= 1),
-    -- A corrected version (v>=2) must carry its provenance: WHY (edit_reason) and WHAT it replaces
-    -- (supersedes_id). v1 is the original and carries neither (P2).
+    -- Correction provenance is BICONDITIONAL: a v1 row is the original and must carry NEITHER
+    -- edit_reason NOR supersedes_id (an "original" can never claim to supersede another record); a
+    -- v>=2 row is a correction and must carry BOTH — WHY (edit_reason) and WHAT it replaces
+    -- (supersedes_id). This forbids v1 rows from carrying correction metadata (P2, round 2).
     CONSTRAINT "task_completions_correction_provenance"
-      CHECK ("version" = 1 OR ("edit_reason" IS NOT NULL AND "supersedes_id" IS NOT NULL))
+      CHECK (
+        ("version" = 1 AND "supersedes_id" IS NULL AND "edit_reason" IS NULL)
+        OR ("version" > 1 AND "supersedes_id" IS NOT NULL AND "edit_reason" IS NOT NULL)
+      )
 );
 
 -- §8.15 evidence (immutable / append-only)
@@ -127,11 +132,15 @@ CREATE POLICY "tenant_isolation" ON "evidence"
 
 -- F3 — recorded_at is server-authoritative (defense in depth over the column DEFAULT). A DEFAULT only
 -- fires when the INSERT omits the column; a caller bypassing buildCompletionInsert() could still supply
--- a backdated recorded_at. This BEFORE INSERT trigger unconditionally overwrites it with now(), so the
+-- a backdated recorded_at. This BEFORE INSERT trigger unconditionally overwrites it, so the
 -- compliance timestamp can never be driven by the client. (client_reported_at stays advisory, untouched.)
+-- We use clock_timestamp() (real wall-clock at row-execution time) rather than now()/CURRENT_TIMESTAMP,
+-- which are fixed at transaction START: a completion inserted after other work in the same withTenant()
+-- transaction would otherwise get a recorded_at that predates the actual insert, and multiple inserts in
+-- one tx would share an identical timestamp — both weakening the F3 "trustworthy when".
 CREATE OR REPLACE FUNCTION set_task_completion_recorded_at() RETURNS trigger AS $$
 BEGIN
-  NEW.recorded_at := now();
+  NEW.recorded_at := clock_timestamp();
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;

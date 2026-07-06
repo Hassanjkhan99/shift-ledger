@@ -235,6 +235,43 @@ describe("F3 — recorded_at is server-authoritative, client_reported_at is advi
     expect(recorded).toBeLessThanOrEqual(Date.now() + 5_000);
   });
 
+  it("stamps recorded_at at insert time (clock_timestamp), not transaction start", async () => {
+    // Two completions inserted in the SAME withTenant transaction must get DISTINCT recorded_at
+    // values, with the second strictly later than the first. Under now()/CURRENT_TIMESTAMP (fixed at
+    // tx START) both would be identical; clock_timestamp() advances mid-transaction. This proves the
+    // F3 "trustworthy when" reflects the real insert instant, not the transaction's opening time.
+    const first = await makeOccurrence(orgAId);
+    const second = await makeOccurrence(orgAId);
+    const [a, b] = await withTenant(orgAId, async (tx) => {
+      const rowA = await tx.taskCompletion.create({
+        data: buildCompletionInsert({
+          organizationId: orgAId,
+          taskOccurrenceId: first.occurrenceId,
+          clientSubmissionId: randomUUID(),
+          result: "pass",
+          completedBy: first.userId,
+        }),
+        select: { recordedAt: true },
+      });
+      // Advance the wall clock within the same transaction so clock_timestamp() moves on.
+      // ($executeRaw returns a row count; pg_sleep returns void which $queryRaw can't deserialize.)
+      await tx.$executeRaw`SELECT pg_sleep(0.01)`;
+      const rowB = await tx.taskCompletion.create({
+        data: buildCompletionInsert({
+          organizationId: orgAId,
+          taskOccurrenceId: second.occurrenceId,
+          clientSubmissionId: randomUUID(),
+          result: "pass",
+          completedBy: second.userId,
+        }),
+        select: { recordedAt: true },
+      });
+      return [rowA, rowB];
+    });
+    // Strictly later — would be EQUAL under now(); clock_timestamp() advanced across the two inserts.
+    expect(b.recordedAt.getTime()).toBeGreaterThan(a.recordedAt.getTime());
+  });
+
   it("buildCompletionInsert never emits a recordedAt key (F3 by construction)", () => {
     const data = buildCompletionInsert({
       organizationId: orgAId,
@@ -380,6 +417,103 @@ describe("versioning invariants (DB CHECK constraints)", () => {
         }),
       ),
     ).rejects.toThrow();
+  });
+
+  it("rejects a v2 that carries only supersedes_id (edit_reason still required)", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    const v1 = await withTenant(orgAId, (tx) =>
+      tx.taskCompletion.create({
+        data: {
+          ...buildCompletionInsert({
+            organizationId: orgAId,
+            taskOccurrenceId: occurrenceId,
+            clientSubmissionId: randomUUID(),
+            result: "pass",
+            completedBy: userId,
+          }),
+          isCurrent: false,
+        },
+        select: { id: true },
+      }),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.taskCompletion.create({
+          data: {
+            ...buildCompletionInsert({
+              organizationId: orgAId,
+              taskOccurrenceId: occurrenceId,
+              clientSubmissionId: randomUUID(),
+              result: "fail",
+              completedBy: userId,
+            }),
+            version: 2,
+            isCurrent: false,
+            supersedesId: v1.id, // has supersedes_id but no edit_reason → violates biconditional
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a v1 that carries correction metadata (an original cannot supersede)", async () => {
+    // A v1 row is the original: it must carry NEITHER supersedes_id NOR edit_reason. The old
+    // `version = 1 OR (...)` form let this through because the v1 branch short-circuited; the
+    // biconditional forbids it so an "original" can never falsely claim to supersede another record.
+    const first = await makeOccurrence(orgAId);
+    const target = await withTenant(orgAId, (tx) =>
+      tx.taskCompletion.create({
+        data: {
+          ...buildCompletionInsert({
+            organizationId: orgAId,
+            taskOccurrenceId: first.occurrenceId,
+            clientSubmissionId: randomUUID(),
+            result: "pass",
+            completedBy: first.userId,
+          }),
+          isCurrent: false,
+        },
+        select: { id: true },
+      }),
+    );
+    const second = await makeOccurrence(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.taskCompletion.create({
+          data: {
+            ...buildCompletionInsert({
+              organizationId: orgAId,
+              taskOccurrenceId: second.occurrenceId,
+              clientSubmissionId: randomUUID(),
+              result: "pass",
+              completedBy: second.userId,
+            }),
+            // version defaults to 1 but we supply correction metadata → must be rejected.
+            supersedesId: target.id,
+            editReason: "an original should not carry this",
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("accepts a clean v1 that carries neither supersedes_id nor edit_reason", async () => {
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    const v1 = await withTenant(orgAId, (tx) =>
+      tx.taskCompletion.create({
+        data: buildCompletionInsert({
+          organizationId: orgAId,
+          taskOccurrenceId: occurrenceId,
+          clientSubmissionId: randomUUID(),
+          result: "pass",
+          completedBy: userId,
+        }),
+        select: { version: true, supersedesId: true, editReason: true },
+      }),
+    );
+    expect(v1.version).toBe(1);
+    expect(v1.supersedesId).toBeNull();
+    expect(v1.editReason).toBeNull();
   });
 
   it("accepts a v2 that carries edit_reason + supersedes_id", async () => {
