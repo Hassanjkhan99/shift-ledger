@@ -54,7 +54,23 @@ interface Offender {
  * `data:` object (the balanced `{ … }` after `data:`), and flag a top-level `status:` key in it.
  */
 function scanSource(code: string): number[] {
-  const offenderOffsets: number[] = [];
+  const lines = code.split("\n");
+  const lineStartOffsets: number[] = [];
+  let acc = 0;
+  for (const line of lines) {
+    lineStartOffsets.push(acc);
+    acc += line.length + 1; // + '\n'
+  }
+  const lineOf = (off: number): number => {
+    let n = 0;
+    for (let i = 0; i < lineStartOffsets.length; i++) {
+      if (lineStartOffsets[i] <= off) n = i;
+      else break;
+    }
+    return n;
+  };
+
+  const offenderLines: number[] = [];
   const callRe = /\.(update|updateMany)\s*\(/g;
   let m: RegExpExecArray | null;
   while ((m = callRe.exec(code)) !== null) {
@@ -71,29 +87,23 @@ function scanSource(code: string): number[] {
     if (braceEnd === -1) continue;
     const dataObj = arg.slice(braceStart + 1, braceEnd);
 
-    // A top-level `status:` key inside the data object is a direct status write.
-    if (/(^|[\s,{])status\s*:/.test(dataObj)) {
-      offenderOffsets.push(argStart);
-    }
-  }
+    // Not a status write → not our concern.
+    if (!/(^|[\s,{])status\s*:/.test(dataObj)) continue;
 
-  // Map offending offsets to 1-based line numbers, honouring the f4-guard-allow escape hatch.
-  const lines = code.split("\n");
-  const lineStartOffsets: number[] = [];
-  let acc = 0;
-  for (const line of lines) {
-    lineStartOffsets.push(acc);
-    acc += line.length + 1; // + '\n'
-  }
-  const offenderLines: number[] = [];
-  for (const off of offenderOffsets) {
-    let lineNo = 0;
-    for (let i = 0; i < lineStartOffsets.length; i++) {
-      if (lineStartOffsets[i] <= off) lineNo = i;
-      else break;
+    // Honour an `f4-guard-allow` marker placed ANYWHERE on the lines this call spans — the call
+    // line, any line inside the `({ … })`, the closing-paren line, or a trailing comment just after
+    // it. Checking the whole span (not just the call line) makes the escape hatch robust to
+    // formatter reflow (Prettier moves a trailing `({ // marker` comment onto the next line).
+    const startLine = lineOf(m.index);
+    const endLine = Math.min(lineOf(argEnd) + 1, lines.length - 1);
+    let marked = false;
+    for (let i = startLine; i <= endLine; i++) {
+      if (lines[i].includes("f4-guard-allow")) {
+        marked = true;
+        break;
+      }
     }
-    if (lines[lineNo].includes("f4-guard-allow")) continue;
-    offenderLines.push(lineNo + 1);
+    if (!marked) offenderLines.push(startLine + 1);
   }
   return offenderLines;
 }
