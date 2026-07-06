@@ -18,6 +18,10 @@ src/generated
 # In-flight automation work (owned by its own issue) — format there, not in #29.
 docs/automation.md
 
+# Generated design-evidence artifacts (extracted handoff bundles, not source):
+# _ds_bundle.js + *.html under docs/evidence/**. Prettier shouldn't touch them. (#80)
+docs/evidence/
+
 # Markdown left unformatted for now: prose/design/governance docs (CLAUDE.md,
 # docs/architecture.md, FLOW.md, README.md, SECURITY.md). Avoids noisy churn and
 # touching shared docs in a tooling PR. Can revisit in its own change.
