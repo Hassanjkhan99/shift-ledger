@@ -177,6 +177,7 @@ async function exceptionEdge(
     // no-op, a user-driven edge that loses the race must fail loudly.
     mutate: async (t) => {
       const res = await t.exception.updateMany({
+        // f4-guard-allow: transition()-wrapped CAS (exception edge)
         where: { id: exceptionId, status: expectedFrom },
         data: { status: to, ...extraData },
       });
@@ -405,6 +406,7 @@ async function correctiveEdge(
     // the sweep's silent no-op, a user-driven edge that loses the race must fail loudly.
     mutate: async (t) => {
       const res = await t.correctiveAction.updateMany({
+        // f4-guard-allow: transition()-wrapped CAS (corrective-action edge)
         where: { id: correctiveActionId, status: expectedFrom, deletedAt: null },
         data: { status: to, ...extraData },
       });
