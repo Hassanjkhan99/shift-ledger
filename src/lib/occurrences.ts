@@ -23,6 +23,7 @@ import { DateTime } from "luxon";
 import { z } from "zod";
 import { CheckType, RecurrenceFreq } from "../generated/prisma/enums";
 import type { OccurrenceStatus } from "../generated/prisma/enums";
+import { Prisma } from "../generated/prisma/client";
 import type { TenantClient } from "./db";
 import { transition, logActivity } from "./transition";
 
@@ -40,7 +41,27 @@ export const RecurrenceSchema = z
     byMonthDay: z.array(z.number().int().min(1).max(31)).min(1).optional(),
     timeOfDay: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "timeOfDay must be HH:mm"),
   })
-  .strict();
+  .strict()
+  // Frequency-specific filter guard: a byWeekday filter only makes sense for weekly and a
+  // byMonthDay filter only for monthly. A mismatched filter (e.g. daily + byWeekday) would be
+  // silently IGNORED by recurrenceFiresOn (daily has no filter branch), materializing more
+  // occurrences than the author intended. Reject the mismatch loudly instead.
+  .superRefine((rec, ctx) => {
+    if (rec.byWeekday !== undefined && rec.freq !== RecurrenceFreq.weekly) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["byWeekday"],
+        message: "byWeekday is only valid when freq === 'weekly'",
+      });
+    }
+    if (rec.byMonthDay !== undefined && rec.freq !== RecurrenceFreq.monthly) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["byMonthDay"],
+        message: "byMonthDay is only valid when freq === 'monthly'",
+      });
+    }
+  });
 
 export type Recurrence = z.infer<typeof RecurrenceSchema>;
 
@@ -100,18 +121,66 @@ export function computeDueAt(localDate: Date, timeOfDay: string, timezone: strin
     return jumped.toJSDate();
   }
 
-  // Fall-back overlap: the same wall time exists twice. Take the EARLIER UTC instant. The later
-  // occurrence is exactly the DST shift (typically +1h in UTC) after the earlier one and reads as
-  // the same wall time. Compute the alternate and pick the minimum, so the outcome is forced by us.
-  const altLater = dt.toUTC().plus({ hours: 1 }).setZone(timezone);
-  const isAmbiguous =
-    altLater.hour === dt.hour && altLater.minute === dt.minute && altLater.offset !== dt.offset; // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
-  if (isAmbiguous) {
-    const earlierMs = Math.min(dt.toMillis(), altLater.toMillis());
-    return new Date(earlierMs);
-  }
+  // Fall-back overlap: the same wall time exists twice. Take the EARLIER (first) UTC instant.
+  // We must NOT rely on which of the two the initial parse picked (dt.isAmbiguous is unreliable
+  // once the generator self-heals earlier on the same local day). Instead, enumerate BOTH candidate
+  // UTC offsets the zone applies to this wall-clock and take the MINIMUM UTC instant, so the earlier
+  // one is chosen regardless of which offset the initial DateTime landed on.
+  const candidates = possibleUtcMillis(
+    localDate.getUTCFullYear(),
+    localDate.getUTCMonth() + 1,
+    localDate.getUTCDate(),
+    hour,
+    minute,
+    timezone,
+  );
+  return new Date(Math.min(...candidates));
+}
 
-  return dt.toJSDate();
+/**
+ * Enumerate every distinct UTC instant that the given local wall-clock maps to in `timezone`. For a
+ * normal (non-DST) wall time this is a single instant; for a fall-back overlap the same wall time
+ * maps to TWO instants (before and after the clock is set back). We probe the two adjacent standard
+ * offsets by building the DateTime once and once shifted by the possible DST delta, keeping only the
+ * candidates that round-trip back to the requested wall-clock. Callers pick min/max as needed.
+ */
+function possibleUtcMillis(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  timezone: string,
+): number[] {
+  const base = DateTime.fromObject({ year, month, day, hour, minute }, { zone: timezone });
+  // Candidate offsets (in minutes) around the base local time: the offset the base resolved to,
+  // and the offsets one hour before / one hour after (which straddle a DST fall-back boundary).
+  // NOTE: luxon .offset below is a DST UTC shift, not SQL OFFSET pagination (F5 guard).
+  const probeOffsets = new Set<number>([
+    base.offset, // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
+    base.minus({ hours: 1 }).offset, // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
+    base.plus({ hours: 1 }).offset, // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
+  ]);
+
+  const millis = new Set<number>();
+  for (const offsetMinutes of probeOffsets) {
+    // A wall-clock at `offsetMinutes` corresponds to this UTC instant…
+    const utc = DateTime.fromObject({ year, month, day, hour, minute }, { zone: "utc" }).minus({
+      minutes: offsetMinutes,
+    });
+    // …but only accept it if, viewed back in `timezone`, it actually reads as the requested wall
+    // time with that same offset (rejects the phantom instant from the offset that doesn't apply). // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
+    const roundTrip = utc.setZone(timezone);
+    if (
+      roundTrip.hour === hour &&
+      roundTrip.minute === minute &&
+      roundTrip.offset === offsetMinutes // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
+    ) {
+      millis.add(utc.toMillis());
+    }
+  }
+  // Fallback: if nothing round-tripped (shouldn't happen for a valid non-gap time), use base.
+  return millis.size > 0 ? [...millis] : [base.toMillis()];
 }
 
 /**
@@ -186,9 +255,28 @@ export interface GenerateArgs {
   now: Date;
 }
 
+/** A schedule that was isolated (skipped) this run because it could not be safely materialized. */
+export interface SkippedSchedule {
+  scheduledTaskId: string;
+  reason: string;
+}
+
 export interface GenerateResult {
   created: number;
+  // Schedules whose recurrence_json failed to parse or whose timezone was invalid. These are
+  // isolated so one bad schedule does not roll back the whole tenant's generation run.
+  skipped: SkippedSchedule[];
 }
+
+// The schedule query's include: check_type + the frozen config_snapshot inputs (targetConfigJson,
+// requiredEvidence) from the template, and the outlet's authoritative property_id. Defined once so
+// the fetch and the ScheduleWithConfig payload type stay in lockstep.
+const SCHEDULE_INCLUDE = {
+  taskTemplate: {
+    select: { checkType: true, targetConfigJson: true, requiredEvidence: true },
+  },
+  outlet: { select: { propertyId: true } },
+} satisfies Prisma.ScheduledTaskInclude;
 
 /**
  * Materialize the rolling 3-day window of occurrences for every active, non-deleted scheduled_task
@@ -203,11 +291,16 @@ export async function generateOccurrences(
 ): Promise<GenerateResult> {
   // Lower bound for the ends_on scan filter. The rolling window is [today_local, today_local+2],
   // so the earliest local date it can touch is "today" in the furthest-east zone. Anchor the bound
-  // at `now - 1 day` (as a date) so it is safely on-or-before any tenant's today_local regardless
-  // of timezone; the precise per-candidate `candidate > endsOn` guard inside the loop still does the
-  // exact exclusion. This keeps the scan off years of ended-but-still-active history rows and lets
-  // the (is_active, ends_on) index do the work.
-  const endsOnLowerBound = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+  // at the UTC-MIDNIGHT of `now`'s date minus one day (a pure DATE, no time-of-day). ends_on is a
+  // @db.Date stored at UTC midnight; if the bound carried a time-of-day (e.g. `now - 24h` at
+  // 00:30Z), then for a zone west of UTC running just after UTC midnight a same-local-day ends_on
+  // (UTC midnight) could compare `<` the bound and be wrongly excluded. Truncating to midnight makes
+  // date-only ends_on values compare correctly; the per-candidate `candidate > endsOn` guard inside
+  // the loop still does the exact exclusion. This keeps the scan off years of ended-but-still-active
+  // history rows and lets the (is_active, ends_on) index do the work.
+  const endsOnLowerBound = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - 24 * 60 * 60 * 1000,
+  );
 
   const schedules = await tx.scheduledTask.findMany({
     where: {
@@ -223,94 +316,136 @@ export async function generateOccurrences(
       OR: [{ endsOn: null }, { endsOn: { gte: endsOnLowerBound } }],
     },
     // check_type is snapshot from the template onto each occurrence (§8.13, denormalized).
+    // targetConfigJson + requiredEvidence are frozen into config_snapshot at generation (§8.13).
     // outlet.propertyId is the AUTHORITATIVE property for the occurrence — see below.
-    include: {
-      taskTemplate: { select: { checkType: true } },
-      outlet: { select: { propertyId: true } },
-    },
+    include: SCHEDULE_INCLUDE,
   });
 
   let created = 0;
+  const skipped: SkippedSchedule[] = [];
 
   for (const schedule of schedules) {
-    const rec = parseRecurrence(schedule.recurrenceJson);
-    const tz = schedule.timezone;
-    // starts_on / ends_on are pure @db.Date values — Prisma hands them back as UTC midnight.
-    // fromJSDate(..., {zone: tz}) would reinterpret that instant in the local zone and, for
-    // zones west of UTC, shift it to the PREVIOUS calendar day (generation could start a day
-    // early / end a day late). Build the DateTime from the UTC Y/M/D fields instead, matching
-    // how occurrence_local_date is anchored below.
-    const startsOn = dateOnlyToLocal(schedule.startsOn, tz);
-    const endsOn = schedule.endsOn ? dateOnlyToLocal(schedule.endsOn, tz) : null;
-    const checkType: CheckType = schedule.taskTemplate.checkType;
-    // Independent FKs let a scheduled_task carry a property_id that doesn't match its outlet's
-    // property. Source the occurrence's property from the OUTLET (the row we already loaded for the
-    // archived-site check) so a materialized occurrence always has a consistent (property, outlet)
-    // pair, never an impossible one.
-    const propertyId = schedule.outlet.propertyId;
-    // Wall-clock comes from the dedicated, editable time_of_day column (not recurrence_json).
-    const timeOfDay = timeOfDayHHmm(schedule.timeOfDay);
-
-    for (const candidate of windowLocalDates(now, tz)) {
-      if (endsOn && candidate > endsOn) continue;
-      if (!recurrenceFiresOn(rec, startsOn, candidate)) continue;
-
-      // occurrence_local_date is a pure DATE — anchor it at UTC midnight so Prisma's @db.Date maps
-      // the intended calendar day regardless of the runner's local zone.
-      const localDate = new Date(Date.UTC(candidate.year, candidate.month - 1, candidate.day));
-      const dueAt = computeDueAt(localDate, timeOfDay, tz);
-
-      // Idempotent create-if-absent. Prisma's createMany with skipDuplicates maps to
-      // INSERT ... ON CONFLICT DO NOTHING; count===0 means the row already existed (never reset it).
-      const result = await tx.taskOccurrence.createMany({
-        data: [
-          {
-            organizationId: schedule.organizationId,
-            propertyId,
-            outletId: schedule.outletId,
-            scheduledTaskId: schedule.id,
-            taskTemplateId: schedule.taskTemplateId,
-            checkType,
-            occurrenceLocalDate: localDate,
-            dueAt,
-            timezone: tz,
-            status: "pending",
-            assigneeRole: schedule.assigneeRole,
-            assigneeUserId: schedule.assigneeUserId,
-          },
-        ],
-        skipDuplicates: true,
+    try {
+      created += await generateForSchedule(tx, schedule, now);
+    } catch (err) {
+      // Isolate a bad schedule: a malformed recurrence_json (parseRecurrence throws) or an invalid
+      // IANA timezone must SKIP just this schedule and continue with the rest, rather than aborting
+      // the whole transaction and rolling back every valid schedule's occurrences.
+      skipped.push({
+        scheduledTaskId: schedule.id,
+        reason: err instanceof Error ? err.message : String(err),
       });
-
-      if (result.count === 0) continue; // already existed — do not overwrite, do not log
-
-      created += result.count;
-
-      // Read back the freshly-created row's id for the audit subject (the (none)→pending log).
-      const inserted = await tx.taskOccurrence.findUnique({
-        where: {
-          scheduledTaskId_occurrenceLocalDate: {
-            scheduledTaskId: schedule.id,
-            occurrenceLocalDate: localDate,
-          },
-        },
-        select: { id: true },
-      });
-
-      if (inserted) {
-        await logActivity(tx, {
-          organizationId: schedule.organizationId,
-          subjectType: "taskOccurrence",
-          subjectId: inserted.id,
-          action: "occurrence.generated",
-          actorLabel: "system:generator",
-          afterJson: { status: "pending", dueAt: dueAt.toISOString() },
-        });
-      }
     }
   }
 
-  return { created };
+  return { created, skipped };
+}
+
+/** The schedule row shape generateForSchedule needs (with the config + outlet includes). */
+type ScheduleWithConfig = Prisma.ScheduledTaskGetPayload<{ include: typeof SCHEDULE_INCLUDE }>;
+
+/**
+ * Materialize the rolling window for a SINGLE schedule. Throws on a malformed recurrence or an
+ * invalid timezone so the caller can isolate (skip) just this schedule. Returns the created count.
+ */
+async function generateForSchedule(
+  tx: TenantClient,
+  schedule: ScheduleWithConfig,
+  now: Date,
+): Promise<number> {
+  const rec = parseRecurrence(schedule.recurrenceJson);
+  const tz = schedule.timezone;
+  // Guard timezone validity explicitly: an invalid IANA zone makes luxon DateTimes .isValid=false
+  // and would silently materialize nothing. Detect it up-front and throw so the caller skips+records.
+  if (!DateTime.now().setZone(tz).isValid) {
+    throw new Error(`generateOccurrences: invalid timezone '${tz}'`);
+  }
+  let created = 0;
+  // starts_on / ends_on are pure @db.Date values — Prisma hands them back as UTC midnight.
+  // fromJSDate(..., {zone: tz}) would reinterpret that instant in the local zone and, for
+  // zones west of UTC, shift it to the PREVIOUS calendar day (generation could start a day
+  // early / end a day late). Build the DateTime from the UTC Y/M/D fields instead, matching
+  // how occurrence_local_date is anchored below.
+  const startsOn = dateOnlyToLocal(schedule.startsOn, tz);
+  const endsOn = schedule.endsOn ? dateOnlyToLocal(schedule.endsOn, tz) : null;
+  const checkType: CheckType = schedule.taskTemplate.checkType;
+  // Independent FKs let a scheduled_task carry a property_id that doesn't match its outlet's
+  // property. Source the occurrence's property from the OUTLET (the row we already loaded for the
+  // archived-site check) so a materialized occurrence always has a consistent (property, outlet)
+  // pair, never an impossible one.
+  const propertyId = schedule.outlet.propertyId;
+  // Wall-clock comes from the dedicated, editable time_of_day column (not recurrence_json).
+  const timeOfDay = timeOfDayHHmm(schedule.timeOfDay);
+
+  // §8.13 config_snapshot invariant: FREEZE the template's threshold + required-evidence config onto
+  // each occurrence at generation time. A later edit to the template's targetConfigJson /
+  // requiredEvidence must not re-judge occurrences that were already materialized under the old
+  // config, so we materialize the snapshot here rather than reading the live template at judge time.
+  const configSnapshot = {
+    targetConfig: (schedule.taskTemplate.targetConfigJson ?? null) as Prisma.InputJsonValue,
+    requiredEvidence: schedule.taskTemplate.requiredEvidence,
+  } satisfies Prisma.InputJsonValue;
+
+  for (const candidate of windowLocalDates(now, tz)) {
+    if (endsOn && candidate > endsOn) continue;
+    if (!recurrenceFiresOn(rec, startsOn, candidate)) continue;
+
+    // occurrence_local_date is a pure DATE — anchor it at UTC midnight so Prisma's @db.Date maps
+    // the intended calendar day regardless of the runner's local zone.
+    const localDate = new Date(Date.UTC(candidate.year, candidate.month - 1, candidate.day));
+    const dueAt = computeDueAt(localDate, timeOfDay, tz);
+
+    // Idempotent create-if-absent. Prisma's createMany with skipDuplicates maps to
+    // INSERT ... ON CONFLICT DO NOTHING; count===0 means the row already existed (never reset it).
+    const result = await tx.taskOccurrence.createMany({
+      data: [
+        {
+          organizationId: schedule.organizationId,
+          propertyId,
+          outletId: schedule.outletId,
+          scheduledTaskId: schedule.id,
+          taskTemplateId: schedule.taskTemplateId,
+          checkType,
+          configSnapshot,
+          occurrenceLocalDate: localDate,
+          dueAt,
+          timezone: tz,
+          status: "pending",
+          assigneeRole: schedule.assigneeRole,
+          assigneeUserId: schedule.assigneeUserId,
+        },
+      ],
+      skipDuplicates: true,
+    });
+
+    if (result.count === 0) continue; // already existed — do not overwrite, do not log
+
+    created += result.count;
+
+    // Read back the freshly-created row's id for the audit subject (the (none)→pending log).
+    const inserted = await tx.taskOccurrence.findUnique({
+      where: {
+        scheduledTaskId_occurrenceLocalDate: {
+          scheduledTaskId: schedule.id,
+          occurrenceLocalDate: localDate,
+        },
+      },
+      select: { id: true },
+    });
+
+    if (inserted) {
+      await logActivity(tx, {
+        organizationId: schedule.organizationId,
+        subjectType: "taskOccurrence",
+        subjectId: inserted.id,
+        action: "occurrence.generated",
+        actorLabel: "system:generator",
+        afterJson: { status: "pending", dueAt: dueAt.toISOString() },
+      });
+    }
+  }
+
+  return created;
 }
 
 export interface SweepArgs {
@@ -355,7 +490,9 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
       mutate: (t) =>
         t.taskOccurrence.updateMany({
           // f4-guard-allow: transition()-wrapped CAS (sweep pending→due)
-          where: { id: occ.id, status: "pending" },
+          // deletedAt: null in the CAS predicate too — a row soft-deleted between the read above
+          // and this write must lose the race (count 0) so the sweep never flips a tombstoned row.
+          where: { id: occ.id, status: "pending", deletedAt: null },
           data: { status: "due" },
         }),
       didMutate: (r) => r.count === 1,
@@ -389,7 +526,9 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
       mutate: (t) =>
         t.taskOccurrence.updateMany({
           // f4-guard-allow: transition()-wrapped CAS (sweep due→overdue)
-          where: { id: occ.id, status: "due" },
+          // deletedAt: null in the CAS predicate too — a row soft-deleted between the read above
+          // and this write must lose the race (count 0) so the sweep never flips a tombstoned row.
+          where: { id: occ.id, status: "due", deletedAt: null },
           data: { status: "overdue" },
         }),
       didMutate: (r) => r.count === 1,

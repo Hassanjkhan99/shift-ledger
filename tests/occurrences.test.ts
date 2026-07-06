@@ -40,10 +40,24 @@ async function siteFor(orgId: string): Promise<{ propertyId: string; outletId: s
 }
 
 /** Create a fresh template in the org (unique title per call). */
-async function makeTemplate(orgId: string, title: string): Promise<string> {
+async function makeTemplate(
+  orgId: string,
+  title: string,
+  opts?: { targetConfigJson?: unknown; requiredEvidence?: ("photo" | "temperature" | "note")[] },
+): Promise<string> {
   return withTenant(orgId, async (tx) => {
     const tpl = await tx.taskTemplate.create({
-      data: { organizationId: orgId, checkType: "temperature", title },
+      data: {
+        organizationId: orgId,
+        checkType: "temperature",
+        title,
+        ...(opts?.targetConfigJson !== undefined
+          ? { targetConfigJson: opts.targetConfigJson as object }
+          : {}),
+        ...(opts?.requiredEvidence !== undefined
+          ? { requiredEvidence: opts.requiredEvidence }
+          : {}),
+      },
       select: { id: true },
     });
     return tpl.id;
@@ -644,6 +658,39 @@ describe("parseRecurrence", () => {
         .byWeekday,
     ).toEqual([1]);
   });
+
+  // Round-3 fix #4: a day-filter must match its frequency. A byWeekday filter is only meaningful
+  // for weekly and byMonthDay only for monthly; a mismatched filter would be silently IGNORED by
+  // recurrenceFiresOn (over-materializing), so reject the mismatch loudly.
+  it("rejects a byWeekday filter unless freq==='weekly' and byMonthDay unless freq==='monthly'", () => {
+    // daily + byWeekday → rejected.
+    expect(() =>
+      parseRecurrence({ freq: "daily", interval: 1, byWeekday: [1], timeOfDay: "06:00" }),
+    ).toThrow();
+    // monthly + byWeekday → rejected.
+    expect(() =>
+      parseRecurrence({ freq: "monthly", interval: 1, byWeekday: [1], timeOfDay: "06:00" }),
+    ).toThrow();
+    // weekly + byMonthDay → rejected.
+    expect(() =>
+      parseRecurrence({ freq: "weekly", interval: 1, byMonthDay: [15], timeOfDay: "06:00" }),
+    ).toThrow();
+    // daily + byMonthDay → rejected.
+    expect(() =>
+      parseRecurrence({ freq: "daily", interval: 1, byMonthDay: [15], timeOfDay: "06:00" }),
+    ).toThrow();
+    // Correct pairings accepted.
+    expect(
+      parseRecurrence({ freq: "weekly", interval: 1, byWeekday: [1, 3], timeOfDay: "06:00" })
+        .byWeekday,
+    ).toEqual([1, 3]);
+    expect(
+      parseRecurrence({ freq: "monthly", interval: 1, byMonthDay: [15], timeOfDay: "06:00" })
+        .byMonthDay,
+    ).toEqual([15]);
+    // A daily with no filters still parses.
+    expect(parseRecurrence({ freq: "daily", interval: 1, timeOfDay: "06:00" }).freq).toBe("daily");
+  });
 });
 
 // ---- grace_minutes range CHECK (fix #2) -----------------------------------------
@@ -728,5 +775,252 @@ describe("generateOccurrences — property_id is sourced from the outlet", () =>
     );
     expect(occ.length).toBeGreaterThan(0);
     expect(occ.every((o) => o.propertyId === outletProperty.propertyId)).toBe(true);
+  });
+});
+
+// ---- config_snapshot frozen at generation (round-3 fix #1, §8.13) ----------------
+describe("generateOccurrences — freezes config_snapshot at generation", () => {
+  it("captures the template config on the occurrence and a later template edit does not change it", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Config snapshot freeze", {
+      targetConfigJson: { minC: 1, maxC: 4 },
+      requiredEvidence: ["photo", "temperature"],
+    });
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+    const now = new Date("2026-07-28T03:00:00Z");
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findFirstOrThrow({
+        where: { scheduledTaskId: st },
+        orderBy: { occurrenceLocalDate: "asc" },
+      }),
+    );
+    // The snapshot captured the template's targetConfig + requiredEvidence at generation time.
+    expect(occ.configSnapshot).toEqual({
+      targetConfig: { minC: 1, maxC: 4 },
+      requiredEvidence: ["photo", "temperature"],
+    });
+
+    // Edit the template AFTER generation. The already-materialized occurrence must NOT change.
+    await withTenant(orgAId, (tx) =>
+      tx.taskTemplate.update({
+        where: { id: tpl },
+        data: { targetConfigJson: { minC: 99, maxC: 100 }, requiredEvidence: ["note"] },
+      }),
+    );
+    const reread = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findUniqueOrThrow({
+        where: { id: occ.id },
+        select: { configSnapshot: true },
+      }),
+    );
+    expect(reread.configSnapshot).toEqual({
+      targetConfig: { minC: 1, maxC: 4 },
+      requiredEvidence: ["photo", "temperature"],
+    });
+  });
+});
+
+// ---- Bad-schedule isolation (round-3 fix #2) ------------------------------------
+describe("generateOccurrences — isolates a bad schedule instead of aborting the whole run", () => {
+  it("skips a bad-timezone and a malformed-recurrence schedule while a valid sibling still materializes", async () => {
+    const siteA = await siteFor(orgAId);
+    const goodTpl = await makeTemplate(orgAId, "Isolation good sibling");
+    const badTzTpl = await makeTemplate(orgAId, "Isolation bad tz");
+    const badRecTpl = await makeTemplate(orgAId, "Isolation bad recurrence");
+
+    // Valid sibling schedule.
+    const goodSt = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: goodTpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+
+    // Bad-timezone schedule: recurrence is fine but the IANA zone is invalid.
+    const badTzSt = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: badTzTpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Not/AZone", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+
+    // Malformed-recurrence schedule: insert raw invalid recurrence_json directly (bypass the typed
+    // helper) so parseRecurrence throws inside generation.
+    const badRecSt = await withTenant(orgAId, (tx) =>
+      tx.scheduledTask
+        .create({
+          data: {
+            organizationId: orgAId,
+            propertyId: siteA.propertyId,
+            outletId: siteA.outletId,
+            taskTemplateId: badRecTpl,
+            recurrenceJson: { freq: "hourly", interval: 0 }, // invalid: bad freq, missing timeOfDay
+            recurrenceFreq: "daily",
+            timeOfDay: new Date("1970-01-01T06:00:00Z"),
+            timezone: "Europe/Berlin",
+            assigneeRole: "KitchenManager",
+            graceMinutes: 15,
+            startsOn: new Date(Date.UTC(2026, 0, 1)),
+            isActive: true,
+          },
+          select: { id: true },
+        })
+        .then((r) => r.id),
+    );
+
+    const now = new Date("2026-08-20T03:00:00Z");
+    const res = await withTenant(orgAId, (tx) =>
+      generateOccurrences(tx, { organizationId: orgAId, now }),
+    );
+
+    // The valid sibling still materialized its window despite the two bad schedules in the same run.
+    const goodOcc = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.count({ where: { scheduledTaskId: goodSt } }),
+    );
+    expect(goodOcc).toBe(3);
+
+    // Both bad schedules were skipped (recorded) and produced no occurrences.
+    const skippedIds = res.skipped.map((s) => s.scheduledTaskId);
+    expect(skippedIds).toContain(badTzSt);
+    expect(skippedIds).toContain(badRecSt);
+    const badCounts = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.count({ where: { scheduledTaskId: { in: [badTzSt, badRecSt] } } }),
+    );
+    expect(badCounts).toBe(0);
+  });
+});
+
+// ---- ends_on lower-bound truncated to a DATE (round-3 fix #3) --------------------
+describe("generateOccurrences — same-local-day ends_on not dropped west of UTC just after UTC midnight", () => {
+  it("a west-of-UTC schedule whose ends_on is today still materializes today", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "West-of-UTC ends_on today");
+    // ends_on = 2026-06-15 (stored at UTC midnight). now is just after UTC midnight on the 15th,
+    // which is still 2026-06-14 evening local in America/New_York → today_local = the 14th, window
+    // touches the 15th. With an instant lower bound of `now - 24h` (carrying 00:30Z) the ends_on
+    // (00:00Z) would compare `<` and be wrongly excluded; the DATE-truncated bound keeps it.
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "09:00" },
+      {
+        timezone: "America/New_York",
+        startsOn: new Date(Date.UTC(2026, 0, 1)),
+        endsOn: new Date(Date.UTC(2026, 5, 15)),
+      },
+    );
+    const now = new Date("2026-06-15T00:30:00Z"); // 2026-06-14 20:30 local NY (EDT)
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({
+        where: { scheduledTaskId: st },
+        orderBy: { occurrenceLocalDate: "asc" },
+      }),
+    );
+    // today_local = the 14th; window = 14, 15, 16. ends_on = 15 → the 14th and 15th materialize,
+    // the 16th is past ends_on. The key assertion: the schedule was NOT dropped from the scan.
+    const days = occ.map((o) => DateTime.fromJSDate(o.occurrenceLocalDate, { zone: "utc" }).day);
+    expect(days).toEqual([14, 15]);
+  });
+});
+
+// ---- DST fall-back earlier instant, robust to initial offset (round-3 fix #5) ----
+describe("computeDueAt — DST fall-back picks the earlier instant regardless of initial parse offset", () => {
+  it("chooses 00:30Z even when the local wall time first resolves to the later (CET) offset", () => {
+    // Same fall-back day as the existing test (2026-10-25 Europe/Berlin, 02:30 occurs twice). The
+    // getPossibleOffsets-based logic must return the EARLIER instant (00:30Z, CEST) regardless of
+    // which offset luxon's initial DateTime landed on.
+    const localDate = new Date(Date.UTC(2026, 9, 25));
+    const due = computeDueAt(localDate, "02:30", "Europe/Berlin");
+    expect(due.toISOString()).toBe("2026-10-25T00:30:00.000Z");
+
+    // Cross-check: the two candidate instants for this wall time are exactly 00:30Z and 01:30Z, and
+    // we picked the minimum. Construct the later one explicitly and confirm it is the +1h alternate.
+    const later = DateTime.fromISO("2026-10-25T01:30:00Z").setZone("Europe/Berlin");
+    expect(later.hour).toBe(2);
+    expect(later.minute).toBe(30);
+    expect(due.getTime()).toBeLessThan(later.toMillis());
+  });
+});
+
+// ---- Sweep CAS excludes rows soft-deleted between read and write (round-3 fix #6)
+describe("sweepOccurrences — CAS updateMany also filters deletedAt: null", () => {
+  it("a row soft-deleted after the sweep read is not flipped to due/overdue and logs nothing", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Sweep CAS deletedAt");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)), graceMinutes: 15 },
+    );
+    const base = {
+      organizationId: orgAId,
+      propertyId: siteA.propertyId,
+      outletId: siteA.outletId,
+      scheduledTaskId: st,
+      taskTemplateId: tpl,
+      checkType: "temperature" as const,
+      timezone: "Europe/Berlin",
+    };
+
+    // A pending and a due row, BOTH past due/grace and BOTH soft-deleted. The sweep's READ excludes
+    // deletedAt-not-null, so these should not appear — but the CAS predicate must also carry
+    // deletedAt: null so that even if they were somehow read, the write flips 0 rows.
+    const pendingDeleted = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence
+        .create({
+          data: {
+            ...base,
+            occurrenceLocalDate: new Date(Date.UTC(2026, 11, 1)),
+            dueAt: new Date("2026-12-01T08:00:00Z"),
+            status: "pending",
+            deletedAt: new Date("2026-12-01T07:00:00Z"),
+          },
+          select: { id: true },
+        })
+        .then((r) => r.id),
+    );
+    const dueDeleted = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence
+        .create({
+          data: {
+            ...base,
+            occurrenceLocalDate: new Date(Date.UTC(2026, 11, 2)),
+            dueAt: new Date("2026-12-01T08:00:00Z"),
+            status: "due",
+            deletedAt: new Date("2026-12-01T07:00:00Z"),
+          },
+          select: { id: true },
+        })
+        .then((r) => r.id),
+    );
+
+    const now = new Date("2026-12-01T09:00:00Z"); // past due_at + 15min grace
+    await withTenant(orgAId, (tx) => sweepOccurrences(tx, { now }));
+
+    const after = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({ where: { id: { in: [pendingDeleted, dueDeleted] } } }),
+    );
+    const byId = new Map(after.map((o) => [o.id, o.status]));
+    expect(byId.get(pendingDeleted)).toBe("pending"); // not swept
+    expect(byId.get(dueDeleted)).toBe("due"); // not swept
+
+    const logs = await withTenant(orgAId, (tx) =>
+      tx.activityLog.findMany({
+        where: {
+          actorLabel: "system:overdue-sweep",
+          subjectId: { in: [pendingDeleted, dueDeleted] },
+        },
+      }),
+    );
+    expect(logs).toHaveLength(0);
   });
 });
