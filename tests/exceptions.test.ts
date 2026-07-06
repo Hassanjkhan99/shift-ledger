@@ -308,6 +308,45 @@ describe("Exception machine (§7.2)", () => {
     expect((await logsFor(orgAId, exceptionId)).length).toBe(auditMid.length); // no extra audit row
   });
 
+  it("a soft-deleted exception cannot be transitioned (edge rejects loudly, writes no audit row)", async () => {
+    const { exceptionId, userId } = await makeException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      tx.exception.update({ where: { id: exceptionId }, data: { deletedAt: new Date() } }),
+    );
+    const auditBefore = await logsFor(orgAId, exceptionId);
+    await expect(
+      withTenant(orgAId, (tx) => acknowledgeException(tx, exceptionId, { actorUserId: userId })),
+    ).rejects.toThrow(/soft-deleted/i);
+    expect((await logsFor(orgAId, exceptionId)).length).toBe(auditBefore.length);
+  });
+
+  it("two openException calls for the same occurrence yield ONE active exception (idempotent retry)", async () => {
+    const fx = await makeOccurrence(orgAId);
+    const openInput = {
+      organizationId: orgAId,
+      propertyId: fx.propertyId,
+      outletId: fx.outletId,
+      taskOccurrenceId: fx.occurrenceId,
+      title: "Fridge over 4C",
+    };
+    const first = await withTenant(orgAId, (tx) =>
+      openException(tx, openInput, { actorUserId: fx.userId }),
+    );
+    const second = await withTenant(orgAId, (tx) =>
+      openException(tx, openInput, { actorUserId: fx.userId }),
+    );
+    // The retry returned the same row, did not create a second.
+    expect(second.id).toBe(first.id);
+    const active = await withTenant(orgAId, (tx) =>
+      tx.exception.count({
+        where: { taskOccurrenceId: fx.occurrenceId, deletedAt: null, status: { not: "verified" } },
+      }),
+    );
+    expect(active).toBe(1);
+    // Only one exception.opened audit row was written.
+    expect(await logsFor(orgAId, first.id, { action: "exception.opened" })).toHaveLength(1);
+  });
+
   it("reopen loop: verified→reopened→acknowledged works", async () => {
     const { exceptionId, userId } = await makeException(orgAId);
     await withTenant(orgAId, (tx) =>
@@ -704,6 +743,140 @@ describe("CorrectiveAction machine (§7.3)", () => {
       assigneeRole: "KitchenManager",
       dueAt: DUE2.toISOString(),
     });
+  });
+
+  it("createCorrectiveAction is allowed under open/acknowledged/in_progress parents", async () => {
+    // open parent
+    const open = await makeException(orgAId);
+    const caOpen = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId: open.exceptionId, description: "under open" },
+        { actorUserId: open.userId },
+      ),
+    );
+    expect(caOpen.status).toBe("open");
+
+    // acknowledged parent
+    const ack = await makeAcknowledgedException(orgAId);
+    const caAck = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId: ack.exceptionId, description: "under acknowledged" },
+        { actorUserId: ack.userId },
+      ),
+    );
+    expect(caAck.status).toBe("open");
+
+    // in_progress parent (drive it there via the assign cascade of the first CA)
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        caAck.id,
+        { assigneeUserId: ack.userId, dueAt: DUE },
+        { actorUserId: ack.userId },
+      ),
+    );
+    const inProgress = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: ack.exceptionId } }),
+    );
+    expect(inProgress.status).toBe("in_progress");
+    const caInProg = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId: ack.exceptionId, description: "under in_progress" },
+        { actorUserId: ack.userId },
+      ),
+    );
+    expect(caInProg.status).toBe("open");
+  });
+
+  it("createCorrectiveAction rejects a resolved parent and a soft-deleted parent", async () => {
+    // Resolved parent: acknowledged exception with a sole CA that is marked done → auto-resolves.
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "sole" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
+    const resolved = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(resolved.status).toBe("resolved");
+    await expect(
+      withTenant(orgAId, (tx) =>
+        createCorrectiveAction(tx, { exceptionId, description: "late" }, { actorUserId: userId }),
+      ),
+    ).rejects.toThrow(/resolved|cannot attach/i);
+
+    // Soft-deleted parent.
+    const del = await makeException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      tx.exception.update({ where: { id: del.exceptionId }, data: { deletedAt: new Date() } }),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        createCorrectiveAction(
+          tx,
+          { exceptionId: del.exceptionId, description: "orphan" },
+          { actorUserId: del.userId },
+        ),
+      ),
+    ).rejects.toThrow(/soft-deleted|cannot attach/i);
+  });
+
+  it("markCorrectiveActionDone / verifyCorrectiveAction require a user actor (system actor rejected)", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "attrib" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+
+    // System actor (actorLabel only) rejected for markDone; CA stays `assigned`, no audit row.
+    const auditBeforeDone = await logsFor(orgAId, ca.id);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        markCorrectiveActionDone(tx, ca.id, { actorLabel: "system:import" }),
+      ),
+    ).rejects.toThrow(/user actor|actorUserId/i);
+    expect((await logsFor(orgAId, ca.id)).length).toBe(auditBeforeDone.length);
+
+    // User actor → ok, completedBy set to the user.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
+    const done = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(done.completedBy).toBe(userId);
+
+    // System actor rejected for verify; CA stays `done`, no audit row.
+    const auditBeforeVerify = await logsFor(orgAId, ca.id);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        verifyCorrectiveAction(tx, ca.id, { actorLabel: "system:import" }),
+      ),
+    ).rejects.toThrow(/user actor|actorUserId/i);
+    expect((await logsFor(orgAId, ca.id)).length).toBe(auditBeforeVerify.length);
+
+    // User actor → ok, verifiedBy set to the user.
+    await withTenant(orgAId, (tx) => verifyCorrectiveAction(tx, ca.id, { actorUserId: userId }));
+    const verified = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(verified.verifiedBy).toBe(userId);
   });
 
   it("rejects illegal edges: open→done and done→assign(direct)", async () => {

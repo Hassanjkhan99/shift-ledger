@@ -226,8 +226,12 @@ export async function submitCompletion(
   //    org-scoped), so a cross-tenant occurrence id would otherwise let this org write against — or
   //    block — another org's occurrence. RLS scopes `tx` to this org, so a foreign occurrence returns
   //    null here; reject before any insert path.
-  const occurrence = await tx.taskOccurrence.findUnique({
-    where: { id: input.taskOccurrenceId },
+  //    ALSO reject a SOFT-DELETED (tombstoned) occurrence: RLS only filters organization_id, so a
+  //    soft-deleted occurrence is still visible under `tx` and would otherwise be treated as writable,
+  //    recording a completion + audit row against a tombstoned task. Filter deletedAt: null so a
+  //    tombstoned occurrence is indistinguishable from a missing one (occurrence_not_found).
+  const occurrence = await tx.taskOccurrence.findFirst({
+    where: { id: input.taskOccurrenceId, deletedAt: null },
     select: { id: true },
   });
   if (!occurrence) {

@@ -383,6 +383,9 @@ model TaskOccurrence {
   scheduledTaskId     String           @map("scheduled_task_id") @db.Uuid
   taskTemplateId      String           @map("task_template_id") @db.Uuid
   checkType           CheckType        @map("check_type")
+  // Frozen copy of the template's threshold + required-evidence config at generation time (§8.13
+  // config_snapshot invariant), so a later template edit cannot re-judge historical occurrences.
+  configSnapshot      Json?            @map("config_snapshot")
   occurrenceLocalDate DateTime         @map("occurrence_local_date") @db.Date
   dueAt               DateTime         @map("due_at") @db.Timestamptz(6)
   timezone            String
@@ -573,7 +576,7 @@ model StaffPin {
   organization Organization @relation(fields: [organizationId], references: [id])
   user         User         @relation(fields: [userId], references: [id])
 
-  @@unique([organizationId, userId])
-  @@index([organizationId, userId])
+  @@unique([organizationId, userId], map: "staff_pins_org_user_key")
+  @@index([organizationId, userId], map: "staff_pins_org_user_idx")
   @@map("staff_pins")
 }

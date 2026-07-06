@@ -171,6 +171,19 @@ export async function verifyActorPin(
     return { ok: false, reason: "locked_out", lockedUntil: row.lockedUntil };
   }
 
+  // An EXPIRED lock (lockedUntil set but <= now) must start a FRESH guess-window. Without this the
+  // counter is stuck at MAX after the first lockout expires: the next wrong PIN increments to MAX+1,
+  // the exact `=== MAX_FAILED_ATTEMPTS` crossing never matches again, and the account is never
+  // re-locked (unlimited guessing after waiting out one lockout). Reset the counter + clear the
+  // stale lock BEFORE the verify/increment path so a wrong PIN increments from 0 and the normal
+  // threshold crossing re-locks. Persisted as its own update; the atomic increment below is unchanged.
+  if (row.lockedUntil && row.lockedUntil <= now) {
+    await tx.staffPin.update({
+      where: { id: row.id },
+      data: { failedAttempts: 0, lockedUntil: null },
+    });
+  }
+
   if (verifyPinHash(pin, row.pinHash)) {
     // The PIN is correct, but the actor must still have an active, non-deleted membership in this
     // org — otherwise a stale shared-tablet completion could be attributed to a deactivated/removed

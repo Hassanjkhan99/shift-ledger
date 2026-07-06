@@ -82,6 +82,18 @@ function windowStartLocalDate(now: Date, days: number, timezone: string): Date {
 }
 
 /**
+ * The window's UPPER bound: the current LOCAL calendar date in `timezone`, anchored at UTC midnight
+ * to align with the `occurrence_local_date` `@db.Date` column. The window includes today
+ * (`[today_local - (days - 1), today_local]`), so a failed occurrence whose local date is AFTER
+ * today (a future-dated or backfilled row) is NOT yet in scope and must not count toward the current
+ * threshold. Pairing this `lte` with the `gte` lower bound bounds the window on BOTH ends.
+ */
+function windowEndLocalDate(now: Date, timezone: string): Date {
+  const todayLocal = DateTime.fromJSDate(now, { zone: timezone }).startOf("day");
+  return new Date(Date.UTC(todayLocal.year, todayLocal.month - 1, todayLocal.day));
+}
+
+/**
  * Has a review request for this exact grouping key already been logged within the window? If so, the
  * review window is still open and we must not emit a duplicate (idempotency).
  *
@@ -143,6 +155,7 @@ export async function evaluateRepeatedDeviation(
   const timezone = trigger.timezone;
 
   // --- Grouping 1: (scheduled_task_id, outlet_id) over 7 local days, threshold 3 ---
+  const windowTo = windowEndLocalDate(input.now, timezone);
   const stWindowFrom = windowStartLocalDate(input.now, SCHEDULED_TASK_WINDOW_DAYS, timezone);
   const stCount = await tx.taskOccurrence.count({
     where: {
@@ -153,7 +166,9 @@ export async function evaluateRepeatedDeviation(
       // A tombstoned failed occurrence is not a live deviation — exclude it from the threshold.
       deletedAt: null,
       // Rolling window keyed on the occurrence's local date (§7.1 occurrences carry a pure DATE).
-      occurrenceLocalDate: { gte: stWindowFrom },
+      // Bounded on BOTH ends: gte the window start AND lte today_local, so a future-dated/backfilled
+      // failure (local date after today) is not counted before its day is in scope.
+      occurrenceLocalDate: { gte: stWindowFrom, lte: windowTo },
     },
   });
   if (stCount >= SCHEDULED_TASK_THRESHOLD) {
@@ -197,7 +212,8 @@ export async function evaluateRepeatedDeviation(
       status: "failed",
       // A tombstoned failed occurrence is not a live deviation — exclude it from the threshold.
       deletedAt: null,
-      occurrenceLocalDate: { gte: tplWindowFrom },
+      // Same both-ends bound as grouping 1: gte the 30-day window start AND lte today_local.
+      occurrenceLocalDate: { gte: tplWindowFrom, lte: windowTo },
     },
   });
   if (tplCount >= TEMPLATE_THRESHOLD) {

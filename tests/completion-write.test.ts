@@ -255,6 +255,45 @@ describe("submitCompletion — F2 idempotent write semantics", () => {
     expect(await completionCount(orgBId, foreign.occurrenceId)).toBe(0);
   });
 
+  it("soft-deleted occurrence: submitting → occurrence_not_found, no completion row, no activity_log", async () => {
+    // A tombstoned occurrence is still visible under RLS (which only filters organization_id), so the
+    // tenant guard must reject it as occurrence_not_found and write nothing.
+    const { occurrenceId, userId } = await makeOccurrence(orgAId);
+    await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.update({
+        where: { id: occurrenceId },
+        data: { deletedAt: new Date() },
+      }),
+    );
+
+    const res = await withTenant(orgAId, (tx) =>
+      submitCompletion(tx, {
+        organizationId: orgAId,
+        taskOccurrenceId: occurrenceId,
+        clientSubmissionId: randomUUID(),
+        result: "pass",
+        completedBy: userId,
+      }),
+    );
+
+    expect(res.status).toBe("occurrence_not_found");
+    if (res.status !== "occurrence_not_found") return;
+    expect(res.occurrenceId).toBe(occurrenceId);
+
+    // No completion row and no completion.created activity_log row for this tombstoned occurrence.
+    expect(await completionCount(orgAId, occurrenceId)).toBe(0);
+    const createdLogsForOccurrence = await withTenant(orgAId, (tx) =>
+      tx.activityLog.count({
+        where: {
+          subjectType: "taskCompletion",
+          action: "completion.created",
+          afterJson: { path: ["taskOccurrenceId"], equals: occurrenceId },
+        },
+      }),
+    );
+    expect(createdLogsForOccurrence).toBe(0);
+  });
+
   it("numeric canonicalization: same key, reading '3.40' then '3.4' → ok idempotent replay", async () => {
     const { occurrenceId, userId } = await makeOccurrence(orgAId);
     const csid = randomUUID();

@@ -93,12 +93,29 @@ export interface OpenExceptionInput {
  * (none) → open. Creates a new exception row in `open` and logs the `(none)→open` edge via
  * transition() (F4). The subject id is not known until the INSERT returns, so we thread it out of
  * mutate() into the transition opts object BEFORE transition() reads it for the audit row.
+ *
+ * Idempotent per occurrence: D2 holds at most ONE active exception per task_occurrence. If a
+ * non-terminal (not `verified`), non-deleted exception already exists for this occurrence, we do
+ * NOT create a second one — we return the existing row (no new audit row). This makes a retried
+ * fail-handler safe. NOTE: this read-then-insert is not serialized against a concurrent opener; the
+ * transaction-level race is tracked separately (#96).
  */
 export async function openException(
   tx: TenantClient,
   input: OpenExceptionInput,
   actor: Actor,
 ): Promise<{ id: string; status: ExceptionStatus }> {
+  const existing = await tx.exception.findFirst({
+    where: {
+      taskOccurrenceId: input.taskOccurrenceId,
+      deletedAt: null,
+      status: { not: ExceptionStatus.verified },
+    },
+    select: { id: true, status: true },
+  });
+  if (existing) {
+    return existing;
+  }
   const opts = {
     organizationId: input.organizationId,
     subjectType: "exception" as const,
@@ -110,6 +127,7 @@ export async function openException(
     reason: actor.reason,
     mutate: async (t: TenantClient) => {
       const row = await t.exception.create({
+        // f4-guard-allow: (none)→open create routed through transition() (opts.subjectId set below)
         data: {
           organizationId: input.organizationId,
           propertyId: input.propertyId,
@@ -146,8 +164,13 @@ async function exceptionEdge(
 ): Promise<{ id: string; status: ExceptionStatus }> {
   const current = await tx.exception.findUniqueOrThrow({
     where: { id: exceptionId },
-    select: { status: true, organizationId: true, resolvedAt: true },
+    select: { status: true, organizationId: true, resolvedAt: true, deletedAt: true },
   });
+  // A soft-deleted exception is a tombstone — its status must not be transitionable, including via a
+  // corrective-action cascade. Reject loudly (mirrors correctiveEdge's deletedAt guard).
+  if (current.deletedAt !== null) {
+    throw new Error(`exception: cannot '${edge}' a soft-deleted exception '${exceptionId}'`);
+  }
   assertFrom("exception", edge, current.status, EXCEPTION_FROM[edge]);
   const expectedFrom = current.status;
 
@@ -178,7 +201,7 @@ async function exceptionEdge(
     mutate: async (t) => {
       const res = await t.exception.updateMany({
         // f4-guard-allow: transition()-wrapped CAS (exception edge)
-        where: { id: exceptionId, status: expectedFrom },
+        where: { id: exceptionId, status: expectedFrom, deletedAt: null },
         data: { status: to, ...extraData },
       });
       if (res.count !== 1) {
@@ -294,8 +317,22 @@ export async function createCorrectiveAction(
 ): Promise<{ id: string; status: CorrectiveStatus }> {
   const parent = await tx.exception.findUniqueOrThrow({
     where: { id: input.exceptionId },
-    select: { organizationId: true },
+    select: { organizationId: true, status: true, deletedAt: true },
   });
+  // Do not attach new remediation work to a dead or done parent. A soft-deleted exception is a
+  // tombstone; a `resolved`/`verified` parent is terminal-ish — a fresh `open` CA under it would be
+  // stranded (assignCorrectiveAction only allows a parent in acknowledged/in_progress), so reject
+  // both up front.
+  if (parent.deletedAt !== null) {
+    throw new Error(
+      `createCorrectiveAction: cannot attach to a soft-deleted exception '${input.exceptionId}'`,
+    );
+  }
+  if (parent.status === ExceptionStatus.resolved || parent.status === ExceptionStatus.verified) {
+    throw new Error(
+      `createCorrectiveAction: cannot attach a corrective action to a '${parent.status}' exception '${input.exceptionId}'`,
+    );
+  }
   const opts = {
     organizationId: parent.organizationId,
     subjectType: "correctiveAction" as const,
@@ -307,6 +344,7 @@ export async function createCorrectiveAction(
     reason: actor.reason,
     mutate: async (t: TenantClient) => {
       const row = await t.correctiveAction.create({
+        // f4-guard-allow: (none)→open create routed through transition() (opts.subjectId set below)
         data: {
           organizationId: parent.organizationId,
           exceptionId: input.exceptionId,
@@ -526,6 +564,13 @@ export async function markCorrectiveActionDone(
   correctiveActionId: string,
   actor: Actor,
 ): Promise<{ id: string; status: CorrectiveStatus }> {
+  // Completion must be attributable to a real user: completedBy is the accountable person. A system
+  // actor (actorLabel only) would store `done` with a null completedBy, losing attribution — reject.
+  if (!actor.actorUserId) {
+    throw new Error(
+      "markCorrectiveActionDone: a user actor (actorUserId) is required — completion must be attributable",
+    );
+  }
   const result = await correctiveEdge(
     tx,
     correctiveActionId,
@@ -533,7 +578,7 @@ export async function markCorrectiveActionDone(
     CorrectiveStatus.done,
     "corrective.done",
     actor,
-    { completedBy: actor.actorUserId ?? null, completedAt: new Date() },
+    { completedBy: actor.actorUserId, completedAt: new Date() },
   );
 
   // Cascade: last CA done on the parent → resolve the exception (only when it is in_progress).
@@ -574,6 +619,13 @@ export async function verifyCorrectiveAction(
   correctiveActionId: string,
   actor: Actor,
 ): Promise<{ id: string; status: CorrectiveStatus }> {
+  // Verification must be attributable to a real user: verifiedBy is the accountable person. A system
+  // actor (actorLabel only) would store `verified` with a null verifiedBy, losing attribution — reject.
+  if (!actor.actorUserId) {
+    throw new Error(
+      "verifyCorrectiveAction: a user actor (actorUserId) is required — verification must be attributable",
+    );
+  }
   const result = await correctiveEdge(
     tx,
     correctiveActionId,
@@ -581,7 +633,7 @@ export async function verifyCorrectiveAction(
     CorrectiveStatus.verified,
     "corrective.verified",
     actor,
-    { verifiedBy: actor.actorUserId ?? null, verifiedAt: new Date() },
+    { verifiedBy: actor.actorUserId, verifiedAt: new Date() },
   );
   return { id: result.id, status: result.status };
 }
