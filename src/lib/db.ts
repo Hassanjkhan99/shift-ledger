@@ -48,6 +48,13 @@ export function withTenant<T>(
 ): Promise<T> {
   return prisma.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT set_config('app.current_org_id', ${organizationId}, true)`;
+    // Pin the session timezone to UTC for this transaction. All compliance timestamps are stored
+    // and compared as UTC instants (F3); without this, a server-set timestamptz (e.g. a BEFORE
+    // INSERT trigger stamping recorded_at) is rendered in the connection's host offset and can be
+    // mis-decoded by the driver adapter on a non-UTC machine. SET LOCAL is transaction-scoped, so
+    // it is safe under transaction-mode connection pooling (Neon/PgBouncer) — unlike a startup
+    // `options` parameter, which the pooler can reject.
+    await tx.$executeRaw`SET LOCAL TIME ZONE 'UTC'`;
     return fn(tx);
   });
 }
