@@ -21,6 +21,7 @@ import { randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 import type { TenantClient } from "./db";
 import { logActivity } from "./transition";
 import { OCCURRENCE_ROLE_MATRIX } from "./permissions";
+import { OrgRole } from "../generated/prisma/enums";
 
 // ---- Named constants ------------------------------------------------------------
 export const PIN_LENGTH = 4;
@@ -38,10 +39,28 @@ const SCRYPT_PREFIX = "scrypt";
 
 const PIN_RE = /^\d{4}$/;
 
+/**
+ * Roles that may complete an occurrence on a shared tablet — the §7.1 completion set (from the
+ * occurrence role matrix). Read-only roles (Auditor, ExternalInspector) are NOT in this set, so a
+ * correct PIN held by such a role fails verification, and they never appear in the pick list even if
+ * a membership scopes them to the outlet's property.
+ */
+const COMPLETION_CAPABLE_ROLES = OCCURRENCE_ROLE_MATRIX.complete;
+
+/** Org-wide completion roles: allowed on ANY outlet regardless of property_scope. */
+const ORG_WIDE_ROLES = [OrgRole.Owner, OrgRole.OrgAdmin] as const;
+
 // ---- Result types ---------------------------------------------------------------
 
-/** Discriminated failure reasons so callers/tests can distinguish the paths. */
-export type VerifyFailureReason = "no_pin" | "locked_out" | "wrong_pin" | "no_membership";
+/**
+ * Discriminated failure reasons so callers/tests can distinguish the paths.
+ * `not_completion_capable`: a correct PIN whose only active membership carries a read-only role
+ * (Auditor/ExternalInspector) that the §7.1 occurrence-complete matrix excludes — attributing a
+ * completion to it would be illegal, so verification fails closed. Like `no_membership`, this is
+ * NOT a bad guess and does not touch the failure counter.
+ */
+export type VerifyFailureReason =
+  "no_pin" | "locked_out" | "wrong_pin" | "no_membership" | "not_completion_capable";
 
 export type VerifyActorPinResult =
   | { ok: true; actorUserId: string }
@@ -155,12 +174,18 @@ export async function verifyActorPin(
   if (verifyPinHash(pin, row.pinHash)) {
     // The PIN is correct, but the actor must still have an active, non-deleted membership in this
     // org — otherwise a stale shared-tablet completion could be attributed to a deactivated/removed
-    // member. This is NOT a bad guess, so it does not touch the failure counter.
+    // member. It must ALSO carry a completion-capable role: a read-only role (Auditor/
+    // ExternalInspector) that once had a PIN would otherwise verify `ok` and let a caller attribute
+    // a completion to a role the §7.1 matrix excludes. Fail closed with a distinct reason.
+    // Neither branch is a bad guess, so neither touches the failure counter.
     const membership = await tx.membership.findFirst({
       where: { organizationId, userId, status: "active", deletedAt: null },
-      select: { id: true },
+      select: { role: true },
     });
     if (!membership) return { ok: false, reason: "no_membership" };
+    if (!(COMPLETION_CAPABLE_ROLES as readonly string[]).includes(membership.role)) {
+      return { ok: false, reason: "not_completion_capable" };
+    }
 
     await tx.staffPin.update({
       where: { id: row.id },
@@ -177,7 +202,13 @@ export async function verifyActorPin(
     data: { failedAttempts: { increment: 1 } },
     select: { failedAttempts: true },
   });
-  const shouldLock = updated.failedAttempts >= MAX_FAILED_ATTEMPTS;
+  // Lock + audit on the EXACT threshold-crossing request only (=== not >=). Under a concurrent
+  // 4→5 / 4→6 race two requests could both read failedAttempts=4 and increment; the one that lands
+  // on 5 crosses the threshold and writes the single lockout row, while the one that lands on 6 must
+  // NOT write a second `actor.pin_lockout` row nor overwrite locked_until. (A value > MAX cannot
+  // occur once locked because the early locked-out return precedes the increment; the `===` guard
+  // makes the single-audit invariant hold even under that race.)
+  const shouldLock = updated.failedAttempts === MAX_FAILED_ATTEMPTS;
 
   if (shouldLock) {
     const lockedUntil = new Date(now.getTime() + LOCKOUT_MINUTES * 60_000);
@@ -213,43 +244,52 @@ export interface PickUser {
 }
 
 /**
- * Roles that may complete an occurrence on a shared tablet — the §7.1 completion set (from the
- * occurrence role matrix). Read-only roles (Auditor, ExternalInspector) are NOT in this set, so they
- * never appear in the pick list even if a membership scopes them to the outlet's property.
- */
-const COMPLETION_CAPABLE_ROLES = OCCURRENCE_ROLE_MATRIX.complete;
-
-/**
- * The on-device pick-user list: active, non-deleted memberships whose scope covers the tablet's
- * outlet AND whose role can complete a task. A membership covers the outlet if its property_scope is
- * NULL or EMPTY (whole-org) OR contains the outlet's property_id. Resolves the outlet's property
- * first, then queries memberships. All through the tenant `tx` (RLS), so it is implicitly org-scoped.
+ * The scope+role predicate for a pickable membership at `propertyId`. Active + non-deleted +
+ * completion-capable, AND (org-wide role OR the property-scope covers this property). Org-wide roles
+ * (Owner/OrgAdmin) complete org-wide, so they bypass the scope predicate even if a stale non-empty
+ * property_scope would otherwise exclude them. A membership covers the property if its property_scope
+ * is NULL or EMPTY (whole-org) OR contains the property id.
  *
  * NULL scope: the `memberships.property_scope` column is a Postgres array WITHOUT a NOT NULL
  * constraint (see the init migration), so a NULL is possible even though Prisma defaults inserts to
- * `[]`. Prisma's `isEmpty`/`has` array filters do NOT match NULL, so NULL is handled explicitly as
- * whole-org here.
+ * `[]`. Prisma's `isEmpty`/`has` array filters do NOT match NULL, so NULL is handled explicitly.
+ */
+function pickEligibleWhere(propertyId: string) {
+  return {
+    status: "active",
+    deletedAt: null,
+    role: { in: [...COMPLETION_CAPABLE_ROLES] },
+    OR: [
+      { role: { in: [...ORG_WIDE_ROLES] } },
+      { propertyScope: { equals: null } },
+      { propertyScope: { isEmpty: true } },
+      { propertyScope: { has: propertyId } },
+    ],
+  };
+}
+
+/**
+ * The on-device pick-user list: active, non-deleted, completion-capable memberships whose scope
+ * covers the tablet's outlet (see pickEligibleWhere). Resolves the outlet's property first, then
+ * queries memberships. All through the tenant `tx` (RLS), so it is implicitly org-scoped.
+ *
+ * FAIL CLOSED on a decommissioned outlet: the outlet lookup requires `deletedAt: null` AND a
+ * non-deleted parent property. A soft-deleted outlet (or one under a soft-deleted property) is
+ * treated as "excluded" — it yields an empty pick list rather than throwing, matching occurrence
+ * generation's excluded-site semantics, so a decommissioned outlet never returns pickable users.
  */
 export async function listPickUsers(
   tx: TenantClient,
   args: { outletId: string },
 ): Promise<PickUser[]> {
-  const outlet = await tx.outlet.findUniqueOrThrow({
-    where: { id: args.outletId },
+  const outlet = await tx.outlet.findFirst({
+    where: { id: args.outletId, deletedAt: null, property: { deletedAt: null } },
     select: { propertyId: true },
   });
+  if (!outlet) return [];
 
   const memberships = await tx.membership.findMany({
-    where: {
-      status: "active",
-      deletedAt: null,
-      role: { in: [...COMPLETION_CAPABLE_ROLES] },
-      OR: [
-        { propertyScope: { equals: null } },
-        { propertyScope: { isEmpty: true } },
-        { propertyScope: { has: outlet.propertyId } },
-      ],
-    },
+    where: pickEligibleWhere(outlet.propertyId),
     select: { userId: true, role: true, user: { select: { name: true } } },
   });
 

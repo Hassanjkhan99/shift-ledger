@@ -51,7 +51,10 @@ async function makeMember(
 /** The seeded property + outlet for an org (seed creates exactly one of each). */
 async function seededOutlet(orgId: string): Promise<{ outletId: string; propertyId: string }> {
   return withTenant(orgId, async (tx) => {
-    const outlet = await tx.outlet.findFirstOrThrow({ select: { id: true, propertyId: true } });
+    const outlet = await tx.outlet.findFirstOrThrow({
+      where: { deletedAt: null },
+      select: { id: true, propertyId: true },
+    });
     return { outletId: outlet.id, propertyId: outlet.propertyId };
   });
 }
@@ -135,6 +138,30 @@ describe("setStaffPin + verifyActorPin (integration)", () => {
     if (!res.ok) expect(res.reason).toBe("no_membership");
 
     // A correct-pin-but-no-membership rejection is NOT a bad guess -> failure counter untouched.
+    const row = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    expect(row.failedAttempts).toBe(0);
+  });
+
+  it("rejects a correct pin held by a read-only role (Auditor) as not_completion_capable (not a wrong attempt)", async () => {
+    // An Auditor who somehow has a PIN (e.g. issued before a role change) must not verify ok — the
+    // §7.1 occurrence-complete matrix excludes read-only roles, so a completion caller cannot
+    // attribute a completion to them.
+    const { userId } = await makeMember(orgAId, { role: "Auditor" });
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "8080" }),
+    );
+
+    const res = await withTenant(orgAId, (tx) =>
+      verifyActorPin(tx, { organizationId: orgAId, userId, pin: "8080", now: new Date() }),
+    );
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.reason).toBe("not_completion_capable");
+
+    // Not a bad guess -> failure counter untouched.
     const row = await withTenant(orgAId, (tx) =>
       tx.staffPin.findUniqueOrThrow({
         where: { organizationId_userId: { organizationId: orgAId, userId } },
@@ -229,6 +256,52 @@ describe("lockout after repeated failures", () => {
     );
     expect(row.failedAttempts).toBe(0);
     expect(row.lockedUntil).toBeNull();
+  });
+
+  it("writes exactly one lockout audit row even when verification is attempted again after the lock", async () => {
+    const { userId } = await makeMember(orgAId);
+    const now = new Date("2026-07-05T08:00:00Z");
+    await withTenant(orgAId, (tx) =>
+      setStaffPin(tx, { organizationId: orgAId, userId, pin: "7777" }),
+    );
+
+    // Cross the threshold.
+    for (let i = 0; i < MAX_FAILED_ATTEMPTS; i++) {
+      await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now }),
+      );
+    }
+
+    const locked = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    const firstLockedUntil = locked.lockedUntil;
+
+    // Further attempts while locked (both wrong and correct pin) hit the early locked-out return
+    // BEFORE the increment, so no second audit row is written and locked_until is not overwritten.
+    for (let i = 0; i < 3; i++) {
+      await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "0000", now }),
+      );
+      await withTenant(orgAId, (tx) =>
+        verifyActorPin(tx, { organizationId: orgAId, userId, pin: "7777", now }),
+      );
+    }
+
+    const lockoutLogs = await withTenant(orgAId, (tx) =>
+      tx.activityLog.findMany({ where: { subjectId: userId, action: "actor.pin_lockout" } }),
+    );
+    expect(lockoutLogs).toHaveLength(1);
+
+    const stillLocked = await withTenant(orgAId, (tx) =>
+      tx.staffPin.findUniqueOrThrow({
+        where: { organizationId_userId: { organizationId: orgAId, userId } },
+      }),
+    );
+    expect(stillLocked.failedAttempts).toBe(MAX_FAILED_ATTEMPTS);
+    expect(stillLocked.lockedUntil?.getTime()).toBe(firstLockedUntil?.getTime());
   });
 
   it("counter regression: each wrong attempt increments by exactly one and locks out at exactly MAX", async () => {
@@ -339,6 +412,41 @@ describe("listPickUsers (§8.8 scoping)", () => {
     expect(ids).toContain(staff.userId);
     expect(ids).toContain(manager.userId);
     expect(ids).not.toContain(auditor.userId);
+  });
+
+  it("a soft-deleted outlet yields no pick users (fail closed)", async () => {
+    const { propertyId } = await seededOutlet(orgAId);
+    // A pickable member exists for the property.
+    await makeMember(orgAId, { propertyScope: [propertyId], role: "Staff", name: "WouldPick" });
+
+    // Create then soft-delete a dedicated outlet under the same property.
+    const outletId = await withTenant(orgAId, async (tx) => {
+      const o = await tx.outlet.create({
+        data: { organizationId: orgAId, propertyId, name: `decom-${randomUUID()}` },
+        select: { id: true },
+      });
+      await tx.outlet.update({ where: { id: o.id }, data: { deletedAt: new Date() } });
+      return o.id;
+    });
+
+    const picked = await withTenant(orgAId, (tx) => listPickUsers(tx, { outletId }));
+    expect(picked).toEqual([]);
+  });
+
+  it("an OrgAdmin with a non-empty property_scope excluding the outlet's property still appears", async () => {
+    const { outletId } = await seededOutlet(orgAId);
+    const otherPropertyId = randomUUID(); // a property the outlet does NOT belong to
+
+    // Org-wide role but carrying a stale scope that would otherwise exclude this outlet.
+    const orgAdmin = await makeMember(orgAId, {
+      propertyScope: [otherPropertyId],
+      role: "OrgAdmin",
+      name: "OrgWideAdmin",
+    });
+
+    const picked = await withTenant(orgAId, (tx) => listPickUsers(tx, { outletId }));
+    const ids = picked.map((p) => p.userId);
+    expect(ids).toContain(orgAdmin.userId);
   });
 });
 
