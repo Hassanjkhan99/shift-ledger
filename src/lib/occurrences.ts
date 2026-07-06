@@ -354,6 +354,7 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
       after: { status: "due" },
       mutate: (t) =>
         t.taskOccurrence.updateMany({
+          // f4-guard-allow: transition()-wrapped CAS (sweep pending→due)
           where: { id: occ.id, status: "pending" },
           data: { status: "due" },
         }),
@@ -387,6 +388,7 @@ export async function sweepOccurrences(tx: TenantClient, { now }: SweepArgs): Pr
       after: { status: "overdue" },
       mutate: (t) =>
         t.taskOccurrence.updateMany({
+          // f4-guard-allow: transition()-wrapped CAS (sweep due→overdue)
           where: { id: occ.id, status: "due" },
           data: { status: "overdue" },
         }),
@@ -426,7 +428,9 @@ async function occurrenceManagerEdge(
   actor: OccurrenceActor,
 ): Promise<{ id: string; status: OccurrenceStatus }> {
   const current = await tx.taskOccurrence.findUniqueOrThrow({
-    where: { id: occurrenceId },
+    // A soft-deleted (tombstoned) occurrence is not a live entity — its status must not be
+    // transitionable, so a manager cannot skip/cancel it (and mint a phantom audit row).
+    where: { id: occurrenceId, deletedAt: null },
     select: { status: true, organizationId: true },
   });
   if (!legalFrom.includes(current.status)) {
@@ -453,8 +457,11 @@ async function occurrenceManagerEdge(
     // transition rolls back (no status change, no audit row). This is a USER edge: it fails loudly,
     // unlike the system sweep's silent didMutate no-op. (Mirrors the #9 exception/CA edges.)
     mutate: async (t) => {
+      // CAS keyed on the read status AND deletedAt: null — a row soft-deleted between the read
+      // and this write also loses the race and rolls the whole transition back.
       const res = await t.taskOccurrence.updateMany({
-        where: { id: occurrenceId, status: expectedFrom },
+        // f4-guard-allow: transition()-wrapped CAS (occurrence skip/cancel edge)
+        where: { id: occurrenceId, status: expectedFrom, deletedAt: null },
         data: { status: to },
       });
       if (res.count !== 1) {

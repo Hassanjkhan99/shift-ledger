@@ -242,6 +242,40 @@ describe("skipOccurrence / cancelOccurrence", () => {
     );
     expect(occ.status).toBe("overdue"); // unchanged
   });
+
+  it("a soft-deleted (tombstoned) occurrence cannot be skipped or cancelled: rejects, no audit row", async () => {
+    const site = await makeSite(orgAId);
+    const occId = await seedOccurrence(orgAId, site, "due", new Date(Date.UTC(2026, 6, 15)));
+    // Tombstone the occurrence — it is no longer a live entity.
+    await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.update({ where: { id: occId }, data: { deletedAt: new Date() } }),
+    );
+    const auditBefore = await withTenant(orgAId, (tx) =>
+      tx.activityLog.count({ where: { subjectId: occId } }),
+    );
+
+    // Both manager edges must reject a deleted-at row (the initial read now filters deletedAt: null,
+    // so findUniqueOrThrow throws) and leave no new audit row behind.
+    await expect(
+      withTenant(orgAId, (tx) =>
+        skipOccurrence(tx, occId, { actorUserId: site.userId, reason: "outlet closed" }),
+      ),
+    ).rejects.toThrow();
+    await expect(
+      withTenant(orgAId, (tx) =>
+        cancelOccurrence(tx, occId, { actorUserId: site.userId, reason: "schedule deleted" }),
+      ),
+    ).rejects.toThrow();
+
+    const { occ, auditAfter } = await withTenant(orgAId, async (tx) => ({
+      // findFirst (not findUnique-on-deletedAt) — read it back regardless of the tombstone.
+      occ: await tx.taskOccurrence.findFirstOrThrow({ where: { id: occId } }),
+      auditAfter: await tx.activityLog.count({ where: { subjectId: occId } }),
+    }));
+    expect(occ.status).toBe("due"); // unchanged — never skipped/cancelled
+    expect(occ.deletedAt).not.toBeNull();
+    expect(auditAfter).toBe(auditBefore); // no skip/cancel audit row minted for a tombstoned row
+  });
 });
 
 // ---- Repeated-deviation review rule ---------------------------------------------
@@ -447,5 +481,38 @@ describe("evaluateRepeatedDeviation", () => {
     const req = res.requested.find((r) => r.groupingKey === "scheduledTask+outlet");
     expect(req).toBeDefined();
     expect(req!.count).toBe(3); // exactly A's three, B's is invisible
+  });
+
+  it("does NOT count a soft-deleted (tombstoned) failed occurrence toward the threshold", async () => {
+    const site = await makeSite(orgAId);
+    // Two live failures on the group (days 0,1) — one short of the threshold of 3.
+    await seedFailures(orgAId, site, 2, 0);
+    // A third failure that is then TOMBSTONED. Without deletedAt:null in the count query this would
+    // tip the (scheduled_task+outlet) window to 3 and WRONGLY fire; excluded, the window stays at 2.
+    const deletedFail = await seedOccurrence(orgAId, site, "failed", dayInWindow(2));
+    await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.update({ where: { id: deletedFail }, data: { deletedAt: new Date() } }),
+    );
+
+    const res = await withTenant(orgAId, (tx) =>
+      evaluateRepeatedDeviation(tx, {
+        organizationId: orgAId,
+        scheduledTaskId: site.scheduledTaskId,
+        taskTemplateId: site.templateId,
+        outletId: site.outletId,
+        // Subject is the (still-deleted) 3rd; the count itself must exclude it, so no request fires.
+        triggeringOccurrenceId: deletedFail,
+        now,
+      }),
+    );
+    // Only 2 LIVE failures remain in the window → below threshold 3 → no review request emitted.
+    expect(res.requested.find((r) => r.groupingKey === "scheduledTask+outlet")).toBeUndefined();
+
+    const count = await withTenant(orgAId, (tx) =>
+      tx.activityLog.count({
+        where: { action: "review.repeated_deviation_requested", subjectId: deletedFail },
+      }),
+    );
+    expect(count).toBe(0); // no request logged — the tombstoned failure did not count
   });
 });

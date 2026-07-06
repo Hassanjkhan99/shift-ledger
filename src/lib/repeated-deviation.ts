@@ -150,6 +150,8 @@ export async function evaluateRepeatedDeviation(
       scheduledTaskId: input.scheduledTaskId,
       outletId: input.outletId,
       status: "failed",
+      // A tombstoned failed occurrence is not a live deviation — exclude it from the threshold.
+      deletedAt: null,
       // Rolling window keyed on the occurrence's local date (§7.1 occurrences carry a pure DATE).
       occurrenceLocalDate: { gte: stWindowFrom },
     },
@@ -193,6 +195,8 @@ export async function evaluateRepeatedDeviation(
       taskTemplateId: input.taskTemplateId,
       outletId: input.outletId,
       status: "failed",
+      // A tombstoned failed occurrence is not a live deviation — exclude it from the threshold.
+      deletedAt: null,
       occurrenceLocalDate: { gte: tplWindowFrom },
     },
   });
