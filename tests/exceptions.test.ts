@@ -79,6 +79,9 @@ async function makeOccurrence(orgId: string): Promise<{
   });
 }
 
+/** A fixed due date used for assignments (assignCorrectiveAction now requires a dueAt). */
+const DUE = new Date("2026-07-10T12:00:00Z");
+
 /** Open a fresh exception in `open` and return its id + the actor user. */
 async function makeException(orgId: string): Promise<{ exceptionId: string; userId: string }> {
   const fx = await makeOccurrence(orgId);
@@ -96,6 +99,15 @@ async function makeException(orgId: string): Promise<{ exceptionId: string; user
     ),
   );
   return { exceptionId: ex.id, userId: fx.userId };
+}
+
+/** Open a fresh exception and advance it to `acknowledged` (the parent state assign requires). */
+async function makeAcknowledgedException(
+  orgId: string,
+): Promise<{ exceptionId: string; userId: string }> {
+  const { exceptionId, userId } = await makeException(orgId);
+  await withTenant(orgId, (tx) => acknowledgeException(tx, exceptionId, { actorUserId: userId }));
+  return { exceptionId, userId };
 }
 
 /** Count activity_log rows for a subject with an optional action/actor filter. */
@@ -229,6 +241,7 @@ describe("Exception machine (§7.2)", () => {
       tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
     );
     expect(resolved.resolvedAt).not.toBeNull();
+    const priorResolvedAt = resolved.resolvedAt!.toISOString();
 
     await withTenant(orgAId, (tx) => reopenException(tx, exceptionId, { actorUserId: userId }));
     const reopened = await withTenant(orgAId, (tx) =>
@@ -237,10 +250,15 @@ describe("Exception machine (§7.2)", () => {
     expect(reopened.status).toBe("reopened");
     expect(reopened.resolvedAt).toBeNull(); // cleared on reopen
 
-    // The prior resolved status remains captured in the reopen edge's before_json audit row.
+    // The prior resolved status AND the resolved_at it cleared are captured in the reopen edge's
+    // before_json audit row; after_json records the cleared (null) resolved_at.
     const reopenLog = await logsFor(orgAId, exceptionId, { action: "exception.reopened" });
     expect(reopenLog).toHaveLength(1);
-    expect(reopenLog[0].beforeJson).toMatchObject({ status: "resolved" });
+    expect(reopenLog[0].beforeJson).toMatchObject({
+      status: "resolved",
+      resolvedAt: priorResolvedAt,
+    });
+    expect(reopenLog[0].afterJson).toMatchObject({ status: "reopened", resolvedAt: null });
   });
 
   it("stale-status CAS: an edge whose expected `from` row was changed underneath it rejects, no extra audit row", async () => {
@@ -367,30 +385,59 @@ describe("CorrectiveAction machine (§7.3)", () => {
   });
 
   it("rejected→assigned rework path works and is audited", async () => {
-    const { exceptionId, userId } = await makeException(orgAId);
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
     const ca = await withTenant(orgAId, (tx) =>
       createCorrectiveAction(tx, { exceptionId, description: "Fix seal" }, { actorUserId: userId }),
     );
+    // Second outstanding CA keeps the parent `in_progress` so the reject below does not reopen it
+    // (a reopened parent could not be reassigned to — that guard is tested separately).
+    const keepOpen = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "outstanding" },
+        { actorUserId: userId },
+      ),
+    );
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        keepOpen.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
     await withTenant(orgAId, (tx) => rejectCorrectiveAction(tx, ca.id, { actorUserId: userId }));
     const reAssigned = await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     expect(reAssigned.status).toBe("assigned");
   });
 
   it("assign requires exactly one assignee (neither → throws, both → throws, one → ok)", async () => {
-    const { exceptionId, userId } = await makeException(orgAId);
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
     const ca = await withTenant(orgAId, (tx) =>
       createCorrectiveAction(tx, { exceptionId, description: "y" }, { actorUserId: userId }),
     );
 
     // Neither assigneeUserId nor assigneeRole → reject before any transition.
     await expect(
-      withTenant(orgAId, (tx) => assignCorrectiveAction(tx, ca.id, {}, { actorUserId: userId })),
+      withTenant(orgAId, (tx) =>
+        assignCorrectiveAction(tx, ca.id, { dueAt: DUE }, { actorUserId: userId }),
+      ),
     ).rejects.toThrow(/exactly one of assigneeUserId or assigneeRole/i);
 
     // Both provided → reject.
@@ -399,7 +446,7 @@ describe("CorrectiveAction machine (§7.3)", () => {
         assignCorrectiveAction(
           tx,
           ca.id,
-          { assigneeUserId: userId, assigneeRole: "KitchenManager" },
+          { assigneeUserId: userId, assigneeRole: "KitchenManager", dueAt: DUE },
           { actorUserId: userId },
         ),
       ),
@@ -417,20 +464,142 @@ describe("CorrectiveAction machine (§7.3)", () => {
       assignCorrectiveAction(
         tx,
         ca.id,
-        { assigneeRole: "KitchenManager" },
+        { assigneeRole: "KitchenManager", dueAt: DUE },
         { actorUserId: userId },
       ),
     );
     expect(assigned.status).toBe("assigned");
   });
 
-  it("rework reassignment (rejected→assigned) clears stale completedBy/completedAt", async () => {
+  it("assign requires a dueAt (missing → throws, present → ok)", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "needs deadline" },
+        { actorUserId: userId },
+      ),
+    );
+
+    // No dueAt → reject before any transition (assignee is valid, only the deadline is missing).
+    await expect(
+      withTenant(orgAId, (tx) =>
+        assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      ),
+    ).rejects.toThrow(/dueAt|due date/i);
+
+    // Still open, no assigned audit row from the failed attempt.
+    const stillOpen = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(stillOpen.status).toBe("open");
+    expect(await logsFor(orgAId, ca.id, { action: "corrective.assigned" })).toHaveLength(0);
+
+    // With a dueAt → ok, and due_at is persisted.
+    const assigned = await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    expect(assigned.status).toBe("assigned");
+    const row = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(row.dueAt?.toISOString()).toBe(DUE.toISOString());
+  });
+
+  it("assign rejects when the parent exception is not acknowledged/in_progress", async () => {
+    // Parent still `open` (never acknowledged) → assign must reject.
     const { exceptionId, userId } = await makeException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "premature" },
+        { actorUserId: userId },
+      ),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        assignCorrectiveAction(
+          tx,
+          ca.id,
+          { assigneeUserId: userId, dueAt: DUE },
+          { actorUserId: userId },
+        ),
+      ),
+    ).rejects.toThrow(/acknowledged.*in_progress|parent exception/i);
+
+    // CA untouched, no assigned audit row.
+    const stillOpen = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findUniqueOrThrow({ where: { id: ca.id } }),
+    );
+    expect(stillOpen.status).toBe("open");
+    expect(await logsFor(orgAId, ca.id, { action: "corrective.assigned" })).toHaveLength(0);
+
+    // Acknowledge the parent → assign now succeeds AND cascades acknowledged → in_progress.
+    await withTenant(orgAId, (tx) =>
+      acknowledgeException(tx, exceptionId, { actorUserId: userId }),
+    );
+    const assigned = await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    expect(assigned.status).toBe("assigned");
+    const ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("in_progress");
+
+    // Assigning a second CA while the parent is already in_progress is also allowed.
+    const ca2 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "second" }, { actorUserId: userId }),
+    );
+    const assigned2 = await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca2.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    expect(assigned2.status).toBe("assigned");
+  });
+
+  it("rework reassignment (rejected→assigned) clears stale completedBy/completedAt", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
     const ca = await withTenant(orgAId, (tx) =>
       createCorrectiveAction(tx, { exceptionId, description: "reseal" }, { actorUserId: userId }),
     );
+    // Keep the parent in_progress across the rework so the reject does not reopen it.
+    const keepOpen = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "outstanding" },
+        { actorUserId: userId },
+      ),
+    );
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        keepOpen.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
 
@@ -442,7 +611,12 @@ describe("CorrectiveAction machine (§7.3)", () => {
 
     await withTenant(orgAId, (tx) => rejectCorrectiveAction(tx, ca.id, { actorUserId: userId }));
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
 
     const reassigned = await withTenant(orgAId, (tx) =>
@@ -453,8 +627,87 @@ describe("CorrectiveAction machine (§7.3)", () => {
     expect(reassigned.completedAt).toBeNull();
   });
 
+  it("corrective-action audit before/after capture the assignee + due change (not just status)", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "audit fields" },
+        { actorUserId: userId },
+      ),
+    );
+    // A second, always-outstanding CA keeps the parent `in_progress` through ca's rework, so the
+    // reject below does not cascade the parent to resolved/reopened (which would block reassigning).
+    const keepOpen = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "keeps parent in_progress" },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        keepOpen.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+
+    // First assign: before has null assignee/role/due, after has the new user assignee + due.
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    // Rework so we can reassign to a different target (role) + due and see the prior owner survive.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
+    await withTenant(orgAId, (tx) => rejectCorrectiveAction(tx, ca.id, { actorUserId: userId }));
+    const DUE2 = new Date("2026-08-01T09:00:00Z");
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeRole: "KitchenManager", dueAt: DUE2 },
+        { actorUserId: userId },
+      ),
+    );
+
+    const assignLogs = await logsFor(orgAId, ca.id, { action: "corrective.assigned" });
+    expect(assignLogs).toHaveLength(2);
+
+    // First assign: assignee/role null → userId/null, due null → DUE.
+    expect(assignLogs[0].beforeJson).toMatchObject({
+      status: "open",
+      assigneeUserId: null,
+      assigneeRole: null,
+      dueAt: null,
+    });
+    expect(assignLogs[0].afterJson).toMatchObject({
+      status: "assigned",
+      assigneeUserId: userId,
+      dueAt: DUE.toISOString(),
+    });
+
+    // Reassign: before captures the PRIOR owner/due (userId/DUE), after the new (role/DUE2). The
+    // prior assignee would be lost if the snapshot only recorded status.
+    expect(assignLogs[1].beforeJson).toMatchObject({
+      assigneeUserId: userId,
+      assigneeRole: null,
+      dueAt: DUE.toISOString(),
+    });
+    expect(assignLogs[1].afterJson).toMatchObject({
+      assigneeUserId: null,
+      assigneeRole: "KitchenManager",
+      dueAt: DUE2.toISOString(),
+    });
+  });
+
   it("rejects illegal edges: open→done and done→assign(direct)", async () => {
-    const { exceptionId, userId } = await makeException(orgAId);
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
     const ca = await withTenant(orgAId, (tx) =>
       createCorrectiveAction(tx, { exceptionId, description: "x" }, { actorUserId: userId }),
     );
@@ -465,12 +718,22 @@ describe("CorrectiveAction machine (§7.3)", () => {
 
     // Drive to done, then assign directly (illegal — assign only from open/rejected).
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
     await expect(
       withTenant(orgAId, (tx) =>
-        assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+        assignCorrectiveAction(
+          tx,
+          ca.id,
+          { assigneeUserId: userId, dueAt: DUE },
+          { actorUserId: userId },
+        ),
       ),
     ).rejects.toThrow(/illegal transition/i);
   });
@@ -492,7 +755,12 @@ describe("cascades (§7.2)", () => {
       ),
     );
     const assigned = await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     expect(assigned.status).toBe("assigned");
 
@@ -523,10 +791,20 @@ describe("cascades (§7.2)", () => {
     );
     // Assigning ca1 cascades the exception acknowledged→in_progress.
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca1.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca1.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca2.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca2.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
 
     // Mark only ca1 done → exception stays in_progress (ca2 still outstanding).
@@ -564,10 +842,20 @@ describe("cascades (§7.2)", () => {
       createCorrectiveAction(tx, { exceptionId, description: "CA2" }, { actorUserId: userId }),
     );
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca1.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca1.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca2.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca2.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
 
     // ca1: done → verified BEFORE the last CA finishes. It must still count as complete.
@@ -598,7 +886,12 @@ describe("cascades (§7.2)", () => {
       createCorrectiveAction(tx, { exceptionId, description: "sole CA" }, { actorUserId: userId }),
     );
     await withTenant(orgAId, (tx) =>
-      assignCorrectiveAction(tx, ca.id, { assigneeUserId: userId }, { actorUserId: userId }),
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
     );
     // Sole CA done → resolve cascade auto-moves the exception to resolved.
     await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
@@ -624,5 +917,141 @@ describe("cascades (§7.2)", () => {
       actorLabel: "system:cascade",
     });
     expect(cascadeReopen).toHaveLength(1);
+  });
+
+  it("rejecting a CA whose parent had already advanced to VERIFIED reopens the parent", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "sole CA" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    // Sole CA done → cascade resolves the exception. Then a manager VERIFIES the exception while the
+    // CA is still `done` (not yet CA-verified). Parent is now `verified` with rework still possible.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId }));
+    await withTenant(orgAId, (tx) => verifyException(tx, exceptionId, { actorUserId: userId }));
+    let ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("verified");
+
+    // Reject the CA → parent must reopen even though it is `verified` (not just `resolved`).
+    const rejected = await withTenant(orgAId, (tx) =>
+      rejectCorrectiveAction(tx, ca.id, { actorUserId: userId }),
+    );
+    expect(rejected.status).toBe("rejected");
+
+    ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("reopened");
+    expect(ex.resolvedAt).toBeNull(); // reopen cleared the stale resolved_at
+
+    const cascadeReopen = await logsFor(orgAId, exceptionId, {
+      action: "exception.reopened",
+      actorLabel: "system:cascade",
+    });
+    expect(cascadeReopen).toHaveLength(1);
+  });
+
+  it("direct resolveException is blocked while a corrective action is unfinished", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "outstanding" },
+        { actorUserId: userId },
+      ),
+    );
+    // Assign cascades the parent acknowledged→in_progress. The CA is `assigned` (unfinished).
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    const inProgress = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(inProgress.status).toBe("in_progress");
+
+    // Direct resolve must be rejected: the D2 "all actions done" rule cannot be bypassed.
+    await expect(
+      withTenant(orgAId, (tx) => resolveException(tx, exceptionId, { actorUserId: userId })),
+    ).rejects.toThrow(/outstanding|corrective action/i);
+    const stillInProgress = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(stillInProgress.status).toBe("in_progress"); // unchanged, no resolve
+
+    // An exception with NO unfinished corrective actions resolves via the direct edge. Use a fresh
+    // in_progress exception with zero CAs — outstanding count is 0, so resolveException succeeds.
+    const fresh = await makeAcknowledgedException(orgAId);
+    await withTenant(orgAId, (tx) =>
+      startExceptionProgress(tx, fresh.exceptionId, { actorUserId: fresh.userId }),
+    );
+    const resolved = await withTenant(orgAId, (tx) =>
+      resolveException(tx, fresh.exceptionId, { actorUserId: fresh.userId }),
+    );
+    expect(resolved.status).toBe("resolved");
+  });
+
+  it("a soft-deleted corrective action cannot be transitioned and does not count toward auto-resolve", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca1 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "live CA" }, { actorUserId: userId }),
+    );
+    const ca2 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(
+        tx,
+        { exceptionId, description: "to be deleted" },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca1.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca2.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+
+    // Soft-delete ca2.
+    await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.update({ where: { id: ca2.id }, data: { deletedAt: new Date() } }),
+    );
+
+    // A soft-deleted CA cannot be transitioned (edge rejects loudly, writes no audit row).
+    const auditBefore = await logsFor(orgAId, ca2.id);
+    await expect(
+      withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca2.id, { actorUserId: userId })),
+    ).rejects.toThrow(/soft-deleted/i);
+    expect((await logsFor(orgAId, ca2.id)).length).toBe(auditBefore.length);
+
+    // Marking the LIVE ca1 done resolves the exception: the deleted ca2 (still `assigned`) must NOT
+    // count as outstanding. remaining = non-deleted CAs not in (done, verified) = 0.
+    await withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca1.id, { actorUserId: userId }));
+    const ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("resolved");
+    expect(ex.resolvedAt).not.toBeNull();
   });
 });

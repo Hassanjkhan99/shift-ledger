@@ -19,6 +19,7 @@
 
 import { ExceptionStatus, CorrectiveStatus } from "../generated/prisma/enums";
 import type { OrgRole } from "../generated/prisma/enums";
+import type { Prisma } from "../generated/prisma/client";
 import type { TenantClient } from "./db";
 import { transition } from "./transition";
 
@@ -47,6 +48,15 @@ const CORRECTIVE_FROM = {
   verify: [CorrectiveStatus.done],
   reject: [CorrectiveStatus.done],
 } as const;
+
+/** Coerce a snapshot value into a JSON-stable form: Dates become ISO strings, null passes through,
+ * everything else (strings/enums) passes through. Keeps before/after_json comparable to what a
+ * plain object literal would serialize to. The snapshot fields here are string/enum/Date/null. */
+function jsonSafe(value: unknown): Prisma.InputJsonValue | null {
+  if (value === null || value === undefined) return null;
+  if (value instanceof Date) return value.toISOString();
+  return value as Prisma.InputJsonValue;
+}
 
 /** Throw a clear error if `current` is not a legal `from` for `edge`. */
 function assertFrom<S extends string>(
@@ -136,10 +146,20 @@ async function exceptionEdge(
 ): Promise<{ id: string; status: ExceptionStatus }> {
   const current = await tx.exception.findUniqueOrThrow({
     where: { id: exceptionId },
-    select: { status: true, organizationId: true },
+    select: { status: true, organizationId: true, resolvedAt: true },
   });
   assertFrom("exception", edge, current.status, EXCEPTION_FROM[edge]);
   const expectedFrom = current.status;
+
+  // Field-level snapshots: status is always captured; when the edge overwrites resolved_at (resolve
+  // sets it, reopen nulls it) the audit before/after also record the prior AND new resolved_at, so
+  // e.g. a reopen preserves the resolved_at it clears.
+  const before: Record<string, Prisma.InputJsonValue | null> = { status: current.status };
+  const after: Record<string, Prisma.InputJsonValue | null> = { status: to };
+  if ("resolvedAt" in extraData) {
+    before.resolvedAt = jsonSafe(current.resolvedAt);
+    after.resolvedAt = jsonSafe(extraData.resolvedAt);
+  }
 
   return transition(tx, {
     organizationId: current.organizationId,
@@ -148,8 +168,8 @@ async function exceptionEdge(
     action,
     actorUserId: actor.actorUserId,
     actorLabel: actor.actorLabel,
-    before: { status: current.status },
-    after: { status: to },
+    before,
+    after,
     reason: actor.reason,
     // Compare-and-set: only flip if the row is still in the status we read (expectedFrom). A
     // concurrent legal edge from the same state loses the race — count !== 1 — and we THROW so the
@@ -194,8 +214,25 @@ export function startExceptionProgress(tx: TenantClient, exceptionId: string, ac
   );
 }
 
-/** in_progress → resolved (sets resolved_at). */
-export function resolveException(tx: TenantClient, exceptionId: string, actor: Actor) {
+/**
+ * in_progress → resolved (sets resolved_at). D2 rule: an exception is only "resolved" once ALL its
+ * corrective actions are complete. The auto-cascade in markCorrectiveActionDone enforces this, but a
+ * DIRECT resolveException must not be able to bypass it — so we reject the resolve if any non-deleted
+ * CA is still outstanding (status not in done/verified).
+ */
+export async function resolveException(tx: TenantClient, exceptionId: string, actor: Actor) {
+  const outstanding = await tx.correctiveAction.count({
+    where: {
+      exceptionId,
+      deletedAt: null,
+      status: { notIn: [CorrectiveStatus.done, CorrectiveStatus.verified] },
+    },
+  });
+  if (outstanding > 0) {
+    throw new Error(
+      `exception: cannot resolve '${exceptionId}' — ${outstanding} corrective action(s) still outstanding (not done/verified)`,
+    );
+  }
   return exceptionEdge(
     tx,
     exceptionId,
@@ -284,9 +321,28 @@ export async function createCorrectiveAction(
   return transition(tx, opts);
 }
 
+// The assignment/completion/verification columns a corrective-action edge may overwrite. The audit
+// before/after snapshots capture the prior AND new value of whichever of these an edge touches (not
+// just `status`), so a reassignment or rework does not lose the previous owner/due/completion.
+const CORRECTIVE_SNAPSHOT_FIELDS = [
+  "assigneeUserId",
+  "assigneeRole",
+  "dueAt",
+  "completedBy",
+  "completedAt",
+  "verifiedBy",
+  "verifiedAt",
+] as const;
+
 /**
  * Generic corrective-action status edge: assert the current status is legal, then flip it through
  * transition(). Returns the updated row plus its parent exception id (for cascades).
+ *
+ * The before/after audit snapshots include `status` PLUS whichever assignment/completion/
+ * verification fields this edge writes (`extraData` keys), so the audit trail records the full
+ * field-level delta — e.g. a reassignment shows the prior assignee/due, a rework shows cleared
+ * completion stamps. Soft-deleted rows (`deletedAt` set) are NOT transitionable: the CAS guard is
+ * keyed on `deletedAt: null`, so a deleted CA fails the edge loudly.
  */
 async function correctiveEdge(
   tx: TenantClient,
@@ -299,10 +355,39 @@ async function correctiveEdge(
 ): Promise<{ id: string; status: CorrectiveStatus; exceptionId: string; organizationId: string }> {
   const current = await tx.correctiveAction.findUniqueOrThrow({
     where: { id: correctiveActionId },
-    select: { status: true, exceptionId: true, organizationId: true },
+    select: {
+      status: true,
+      exceptionId: true,
+      organizationId: true,
+      deletedAt: true,
+      assigneeUserId: true,
+      assigneeRole: true,
+      dueAt: true,
+      completedBy: true,
+      completedAt: true,
+      verifiedBy: true,
+      verifiedAt: true,
+    },
   });
+  // A soft-deleted CA is not a live entity — its status must not be transitionable.
+  if (current.deletedAt !== null) {
+    throw new Error(
+      `correctiveAction: cannot '${edge}' a soft-deleted corrective action '${correctiveActionId}'`,
+    );
+  }
   assertFrom("correctiveAction", edge, current.status, CORRECTIVE_FROM[edge]);
   const expectedFrom = current.status;
+
+  // Build field-level before/after snapshots: status is always captured; each field this edge
+  // overwrites (present in extraData) contributes its prior value (before) and new value (after).
+  const before: Record<string, Prisma.InputJsonValue | null> = { status: current.status };
+  const after: Record<string, Prisma.InputJsonValue | null> = { status: to };
+  for (const field of CORRECTIVE_SNAPSHOT_FIELDS) {
+    if (field in extraData) {
+      before[field] = jsonSafe(current[field]);
+      after[field] = jsonSafe(extraData[field]);
+    }
+  }
 
   const updated = await transition(tx, {
     organizationId: current.organizationId,
@@ -311,16 +396,16 @@ async function correctiveEdge(
     action,
     actorUserId: actor.actorUserId,
     actorLabel: actor.actorLabel,
-    before: { status: current.status },
-    after: { status: to },
+    before,
+    after,
     reason: actor.reason,
-    // Compare-and-set: only flip if the row is still in the status we read (expectedFrom). A
-    // concurrent legal edge from the same state loses the race — count !== 1 — and we THROW so the
-    // whole transition rolls back (no status change, no audit row). Unlike the sweep's silent
-    // no-op, a user-driven edge that loses the race must fail loudly.
+    // Compare-and-set: only flip if the row is still in the status we read (expectedFrom) AND still
+    // live (deletedAt null). A concurrent legal edge from the same state loses the race — count !==
+    // 1 — and we THROW so the whole transition rolls back (no status change, no audit row). Unlike
+    // the sweep's silent no-op, a user-driven edge that loses the race must fail loudly.
     mutate: async (t) => {
       const res = await t.correctiveAction.updateMany({
-        where: { id: correctiveActionId, status: expectedFrom },
+        where: { id: correctiveActionId, status: expectedFrom, deletedAt: null },
         data: { status: to, ...extraData },
       });
       if (res.count !== 1) {
@@ -341,9 +426,13 @@ export interface AssignCorrectiveActionInput {
 }
 
 /**
- * open → assigned AND rejected → assigned. Sets assignee + due_at. If this moves the CA into
- * `assigned` while its parent exception is still `acknowledged`, cascade the exception
- * acknowledged → in_progress (§7.2) in the same tx (actorLabel 'system:cascade').
+ * open → assigned AND rejected → assigned. Sets assignee + due_at. §7.3: an `assigned` CA has an
+ * assignee AND a due date — so we require exactly one assignee target AND a non-null dueAt (a CA
+ * assigned without a deadline can never surface on the (organization_id, status, due_at) overdue
+ * path). The parent exception must already be `acknowledged` or `in_progress`: assigning while the
+ * parent is still open/reopened (or terminal) would skip the acknowledged→in_progress cascade and
+ * strand the parent. When the parent is `acknowledged`, this still cascades it → in_progress (§7.2)
+ * in the same tx (actorLabel 'system:cascade').
  */
 export async function assignCorrectiveAction(
   tx: TenantClient,
@@ -358,6 +447,34 @@ export async function assignCorrectiveAction(
   if (hasUser === hasRole) {
     throw new Error(
       "assignCorrectiveAction: exactly one of assigneeUserId or assigneeRole must be provided",
+    );
+  }
+  // A due date is mandatory: assignment sets the deadline the overdue path keys on.
+  if (input.dueAt === undefined || input.dueAt === null) {
+    throw new Error("assignCorrectiveAction: a dueAt (due date) is required when assigning");
+  }
+
+  // Assert the CA's OWN legal edge first (so an illegal assign — e.g. from `done` — fails as an
+  // illegal transition, not a parent-state error), then require the parent exception to be actively
+  // in remediation (acknowledged or in_progress). Assigning while the parent is still open/reopened
+  // or already terminal would either strand an un-acknowledged parent or attach work to a done one.
+  const caBefore = await tx.correctiveAction.findUniqueOrThrow({
+    where: { id: correctiveActionId },
+    select: { status: true, deletedAt: true, exception: { select: { status: true } } },
+  });
+  if (caBefore.deletedAt !== null) {
+    throw new Error(
+      `correctiveAction: cannot 'assign' a soft-deleted corrective action '${correctiveActionId}'`,
+    );
+  }
+  assertFrom("correctiveAction", "assign", caBefore.status, CORRECTIVE_FROM.assign);
+  const parentStatus = caBefore.exception.status;
+  if (
+    parentStatus !== ExceptionStatus.acknowledged &&
+    parentStatus !== ExceptionStatus.in_progress
+  ) {
+    throw new Error(
+      `assignCorrectiveAction: parent exception must be 'acknowledged' or 'in_progress' to assign a corrective action (was '${parentStatus}')`,
     );
   }
 
@@ -482,14 +599,16 @@ export async function rejectCorrectiveAction(
     actor,
   );
 
-  // Cascade: rejecting this CA's work means the exception is no longer resolved. If the resolve
-  // cascade had already auto-moved the parent to `resolved` (because this CA was done), move it
-  // back resolved → reopened (§7.2) in the same tx (actorLabel 'system:cascade').
+  // Cascade: rejecting this CA's work means the exception is no longer resolved. If the parent had
+  // already advanced to `resolved` (via the done-cascade) OR further to `verified` (a manager
+  // verified it while this CA was still `done`), move it back → reopened (§7.2) in the same tx
+  // (actorLabel 'system:cascade'). `reopen`'s legal `from` is {resolved, verified}, so both cases
+  // are covered by the same edge.
   const parent = await tx.exception.findUniqueOrThrow({
     where: { id: result.exceptionId },
     select: { status: true },
   });
-  if (parent.status === ExceptionStatus.resolved) {
+  if (parent.status === ExceptionStatus.resolved || parent.status === ExceptionStatus.verified) {
     await exceptionEdge(
       tx,
       result.exceptionId,
