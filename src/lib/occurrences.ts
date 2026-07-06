@@ -32,8 +32,11 @@ export const RecurrenceSchema = z
   .object({
     freq: z.enum([RecurrenceFreq.daily, RecurrenceFreq.weekly, RecurrenceFreq.monthly]),
     interval: z.number().int().positive(),
-    byWeekday: z.array(z.number().int().min(1).max(7)).optional(),
-    byMonthDay: z.array(z.number().int().min(1).max(31)).optional(),
+    // When present, a day-filter must list at least one day. An empty array is NOT "matches
+    // nothing" — it is a malformed schedule that would silently generate zero occurrences, so
+    // reject it loudly (.min(1)) rather than letting recurrenceFiresOn treat [] as a filter.
+    byWeekday: z.array(z.number().int().min(1).max(7)).min(1).optional(),
+    byMonthDay: z.array(z.number().int().min(1).max(31)).min(1).optional(),
     timeOfDay: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "timeOfDay must be HH:mm"),
   })
   .strict();
@@ -197,6 +200,14 @@ export async function generateOccurrences(
   tx: TenantClient,
   { organizationId, now }: GenerateArgs,
 ): Promise<GenerateResult> {
+  // Lower bound for the ends_on scan filter. The rolling window is [today_local, today_local+2],
+  // so the earliest local date it can touch is "today" in the furthest-east zone. Anchor the bound
+  // at `now - 1 day` (as a date) so it is safely on-or-before any tenant's today_local regardless
+  // of timezone; the precise per-candidate `candidate > endsOn` guard inside the loop still does the
+  // exact exclusion. This keeps the scan off years of ended-but-still-active history rows and lets
+  // the (is_active, ends_on) index do the work.
+  const endsOnLowerBound = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
   const schedules = await tx.scheduledTask.findMany({
     where: {
       organizationId,
@@ -206,9 +217,16 @@ export async function generateOccurrences(
       // tombstoned outlet or property, even if the schedule row itself is still active.
       outlet: { deletedAt: null },
       property: { deletedAt: null },
+      // Drop schedules that ended before the window could touch them, in the scan itself (not just
+      // the in-loop guard) so a tenant's ended-history rows don't get fetched every run.
+      OR: [{ endsOn: null }, { endsOn: { gte: endsOnLowerBound } }],
     },
     // check_type is snapshot from the template onto each occurrence (§8.13, denormalized).
-    include: { taskTemplate: { select: { checkType: true } } },
+    // outlet.propertyId is the AUTHORITATIVE property for the occurrence — see below.
+    include: {
+      taskTemplate: { select: { checkType: true } },
+      outlet: { select: { propertyId: true } },
+    },
   });
 
   let created = 0;
@@ -224,6 +242,11 @@ export async function generateOccurrences(
     const startsOn = dateOnlyToLocal(schedule.startsOn, tz);
     const endsOn = schedule.endsOn ? dateOnlyToLocal(schedule.endsOn, tz) : null;
     const checkType: CheckType = schedule.taskTemplate.checkType;
+    // Independent FKs let a scheduled_task carry a property_id that doesn't match its outlet's
+    // property. Source the occurrence's property from the OUTLET (the row we already loaded for the
+    // archived-site check) so a materialized occurrence always has a consistent (property, outlet)
+    // pair, never an impossible one.
+    const propertyId = schedule.outlet.propertyId;
     // Wall-clock comes from the dedicated, editable time_of_day column (not recurrence_json).
     const timeOfDay = timeOfDayHHmm(schedule.timeOfDay);
 
@@ -242,7 +265,7 @@ export async function generateOccurrences(
         data: [
           {
             organizationId: schedule.organizationId,
-            propertyId: schedule.propertyId,
+            propertyId,
             outletId: schedule.outletId,
             scheduledTaskId: schedule.id,
             taskTemplateId: schedule.taskTemplateId,

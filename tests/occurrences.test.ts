@@ -623,4 +623,105 @@ describe("parseRecurrence", () => {
     expect(() => parseRecurrence({ freq: "daily", interval: 1, timeOfDay: "6am" })).toThrow();
     expect(() => parseRecurrence({ freq: "hourly", interval: 1, timeOfDay: "06:00" })).toThrow();
   });
+
+  // Fix #1: an empty day-filter array is a malformed schedule (silently generates nothing), not a
+  // valid "matches nothing" filter — reject it loudly so it never reaches generation.
+  it("rejects an empty byWeekday / byMonthDay array", () => {
+    expect(() =>
+      parseRecurrence({ freq: "weekly", interval: 1, byWeekday: [], timeOfDay: "06:00" }),
+    ).toThrow();
+    expect(() =>
+      parseRecurrence({ freq: "monthly", interval: 1, byMonthDay: [], timeOfDay: "06:00" }),
+    ).toThrow();
+    // A populated array still parses.
+    expect(
+      parseRecurrence({ freq: "weekly", interval: 1, byWeekday: [1], timeOfDay: "06:00" })
+        .byWeekday,
+    ).toEqual([1]);
+  });
+});
+
+// ---- grace_minutes range CHECK (fix #2) -----------------------------------------
+describe("scheduled_tasks — grace_minutes 0..60 CHECK (D3)", () => {
+  it("rejects grace_minutes outside 0..60 (61 and -1)", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Grace range check");
+    await expect(
+      makeSchedule(
+        orgAId,
+        { ...siteA, templateId: tpl },
+        { freq: "daily", interval: 1, timeOfDay: "06:00" },
+        { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)), graceMinutes: 61 },
+      ),
+    ).rejects.toThrow();
+    await expect(
+      makeSchedule(
+        orgAId,
+        { ...siteA, templateId: tpl },
+        { freq: "daily", interval: 1, timeOfDay: "06:00" },
+        { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)), graceMinutes: -1 },
+      ),
+    ).rejects.toThrow();
+    // A boundary value (60) is accepted.
+    const ok = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)), graceMinutes: 60 },
+    );
+    expect(ok).toBeTruthy();
+  });
+});
+
+// ---- Ended schedules filtered out of the scan (fix #4) --------------------------
+describe("generateOccurrences — ended schedules are not fetched/materialized", () => {
+  it("a schedule whose ends_on is well in the past generates nothing", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Ended schedule skip");
+    // ends_on = 2020-01-31, active-for-history but far before any window `now` below could touch.
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      {
+        timezone: "Europe/Berlin",
+        startsOn: new Date(Date.UTC(2020, 0, 1)),
+        endsOn: new Date(Date.UTC(2020, 0, 31)),
+      },
+    );
+    const now = new Date("2026-07-10T03:00:00Z");
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.count({ where: { scheduledTaskId: st } }),
+    );
+    expect(occ).toBe(0); // ended long ago → excluded from the scan, nothing materialized
+  });
+});
+
+// ---- Occurrence property_id derives from the outlet (fix #5) --------------------
+describe("generateOccurrences — property_id is sourced from the outlet", () => {
+  it("materialized occurrences carry the outlet's property_id", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Outlet-derived property");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+    // The authoritative property is the outlet's own property, regardless of the schedule row.
+    const outletProperty = await withTenant(orgAId, (tx) =>
+      tx.outlet.findUniqueOrThrow({
+        where: { id: siteA.outletId },
+        select: { propertyId: true },
+      }),
+    );
+    const now = new Date("2026-07-14T03:00:00Z");
+    await withTenant(orgAId, (tx) => generateOccurrences(tx, { organizationId: orgAId, now }));
+    const occ = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.findMany({ where: { scheduledTaskId: st } }),
+    );
+    expect(occ.length).toBeGreaterThan(0);
+    expect(occ.every((o) => o.propertyId === outletProperty.propertyId)).toBe(true);
+  });
 });

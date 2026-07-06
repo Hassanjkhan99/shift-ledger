@@ -94,6 +94,11 @@ CREATE TABLE "task_occurrences" (
 ALTER TABLE "scheduled_tasks" ADD CONSTRAINT "scheduled_tasks_assignee_exactly_one"
   CHECK (("assignee_role" IS NOT NULL) <> ("assignee_user_id" IS NOT NULL));
 
+-- D3: grace is locked to 0-60 minutes. sweepOccurrences uses grace_minutes directly, so a
+-- malformed value would silently distort the due-to-overdue transition; reject it at the column.
+ALTER TABLE "scheduled_tasks" ADD CONSTRAINT "scheduled_tasks_grace_minutes_range"
+  CHECK ("grace_minutes" >= 0 AND "grace_minutes" <= 60);
+
 -- ============================================================================
 -- Indexes
 -- ============================================================================
