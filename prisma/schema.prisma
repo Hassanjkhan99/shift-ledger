@@ -193,5 +193,8 @@ model ActivityLog {
 
   @@index([organizationId, subjectType, subjectId, seq])
   @@index([organizationId, createdAt])
+  // Org-wide timeline seek (F5 keyset by seq): the per-subject index above cannot serve
+  // `WHERE organization_id = ? ORDER BY seq DESC` without a sort. (#55)
+  @@index([organizationId, seq])
   @@map("activity_log")
 }

@@ -30,6 +30,25 @@ Three paths, do not mix them up:
 
 **Thin REST** (`src/app/api/*`) only for what must live outside React: signed uploads, export downloads, cron/Inngest, webhooks, future mobile API.
 
+## Pagination (keyset, never OFFSET) — F5
+
+Every list that **grows** (`activity_log`/timeline, occurrence history, notifications, exceptions — retention is 1095 days) paginates with **keyset (seek) pagination** via `keysetPaginate()` in [`src/lib/keyset.ts`](../src/lib/keyset.ts). **Never `OFFSET` / Prisma `skip:`** — OFFSET degrades linearly and, worse, skips or repeats rows when a concurrent write shifts the list, which for an append-only audit stream is a correctness bug. A test guard (`tests/keyset.test.ts`) fails the build if `OFFSET`/`skip:` appears in `src/` read paths.
+
+```ts
+const { items, nextCursor } = await withTenant(orgId, (tx) =>
+  keysetPaginate({
+    keys: [{ field: "seq", direction: "desc" }], // per-org seq for activity_log; UUIDv7 id elsewhere
+    params: { cursor, limit: 50 },
+    baseWhere: { organizationId: orgId }, // your own filters merge in here
+    fetch: (args) => tx.activityLog.findMany(args),
+  }),
+);
+```
+
+- Cursor is **opaque** (base64url); a null/absent cursor means the first page, and `nextCursor === null` means the list is exhausted.
+- Sort on a **monotonic** key so concurrent inserts land ahead of the cursor: per-org `seq` for the timeline, UUIDv7 `id` (time-ordered) or `(occurrence_local_date, id)` for the others.
+- The primitive is proven against `activity_log` today; the timeline/occurrence/notification/exception **endpoints adopt it as they land** (M4/M6/M8, their own tickets).
+
 ## Security conventions (non-negotiable)
 
 - App connects as the **non-superuser** DB role (superusers bypass RLS). Migrations/seed use the elevated role only.
