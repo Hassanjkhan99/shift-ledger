@@ -12,6 +12,16 @@
 // 20260706130000_composite_fk_tenant; the model @relation definitions below stay SINGLE-COLUMN
 // (queries use the scalar _id fields), so `prisma migrate dev` drift against them is expected/known
 // — same convention as the partial index / CHECK constraints that also live only in migrations.
+//
+// ACTOR/ASSIGNEE TENANT-MEMBERSHIP (COMPOSITE) FOREIGN KEYS (#95): the assignee/actor user columns
+// (scheduled_tasks.assignee_user_id, task_completions.completed_by, exceptions.opened_by,
+// corrective_actions.assignee_user_id/completed_by/verified_by) additionally carry a COMPOSITE FK
+// (organization_id, <actor_col>) -> memberships(organization_id, user_id), so a named actor MUST be a
+// member of the SAME org (the single-column users FK alone can't express that — users is global and FK
+// checks bypass RLS). These are DB-level INTEGRITY constraints only (existence of an in-org
+// membership); the ACTIVE/non-deleted membership check is enforced at the app write layer. They live
+// ONLY in migration 20260706140000_actor_membership_fk; the @relation definitions below stay
+// single-column to `users`, so `prisma migrate dev` drift against them is expected/known.
 
 generator client {
   provider = "prisma-client"

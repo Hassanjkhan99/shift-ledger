@@ -500,7 +500,12 @@ export async function assignCorrectiveAction(
   // or already terminal would either strand an un-acknowledged parent or attach work to a done one.
   const caBefore = await tx.correctiveAction.findUniqueOrThrow({
     where: { id: correctiveActionId },
-    select: { status: true, deletedAt: true, exception: { select: { status: true } } },
+    select: {
+      status: true,
+      deletedAt: true,
+      organizationId: true,
+      exception: { select: { status: true } },
+    },
   });
   if (caBefore.deletedAt !== null) {
     throw new Error(
@@ -508,6 +513,31 @@ export async function assignCorrectiveAction(
     );
   }
   assertFrom("correctiveAction", "assign", caBefore.status, CORRECTIVE_FROM.assign);
+
+  // #95: a user assignee must be an ACTIVE, non-deleted member of THIS CA's org. The composite FK
+  // (organization_id, assignee_user_id) -> memberships(organization_id, user_id) already rejects a
+  // non-member / cross-tenant id at the DB level, but an FK can only prove membership EXISTS — it
+  // cannot filter on status='active' / deleted_at IS NULL. So catch an inactive or soft-deleted
+  // member here (the FK cannot). The analogous checks for completion `completed_by` and
+  // scheduled-task assignees live at their own write paths (the M4 #17 action layer); completion
+  // actors are already validated by resolveCompletionActor / isEligiblePickUser.
+  if (input.assigneeUserId !== undefined && input.assigneeUserId !== null) {
+    const activeMember = await tx.membership.findFirst({
+      where: {
+        organizationId: caBefore.organizationId,
+        userId: input.assigneeUserId,
+        status: "active",
+        deletedAt: null,
+      },
+      select: { id: true },
+    });
+    if (!activeMember) {
+      throw new Error(
+        `assignCorrectiveAction: assignee '${input.assigneeUserId}' is not an active member of this organization`,
+      );
+    }
+  }
+
   const parentStatus = caBefore.exception.status;
   if (
     parentStatus !== ExceptionStatus.acknowledged &&
