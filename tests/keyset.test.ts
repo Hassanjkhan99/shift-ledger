@@ -2,6 +2,7 @@ import { describe, it, expect, inject, afterAll } from "vitest";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { withTenant, disconnect } from "../src/lib/db";
+import { logActivity } from "../src/lib/transition";
 import {
   encodeCursor,
   decodeCursor,
@@ -208,14 +209,13 @@ describe("keyset over activity_log — real RLS-scoped, append-only reads", () =
   const insertRows = (n: number) =>
     withTenant(orgAId, async (tx) => {
       for (let i = 0; i < n; i++) {
-        await tx.activityLog.create({
-          data: {
-            organizationId: orgAId,
-            subjectType: "organization",
-            subjectId: orgAId,
-            action: ACTION,
-            actorLabel: "system:test",
-          },
+        // Append via log_activity() (#13); direct app_user inserts are rejected by the guard trigger.
+        await logActivity(tx, {
+          organizationId: orgAId,
+          subjectType: "organization",
+          subjectId: orgAId,
+          action: ACTION,
+          actorLabel: "system:test",
         });
       }
     });

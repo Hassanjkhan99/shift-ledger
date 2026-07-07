@@ -305,8 +305,10 @@ model Outlet {
 }
 
 // Append-only audit log. No updated_at / deleted_at. UPDATE/DELETE rejected by a
-// database trigger (see the rls_immutability migration). Per-org dense seq + hash
-// chain (F6) is deferred to a later milestone; seq here is a global ordering sequence.
+// database trigger (see the rls_immutability migration). `seq` is a global ordering
+// sequence (F5 keyset). The tamper-evident hash chain (F6, #13) adds a per-org DENSE
+// chain_seq + prev_hash/row_hash, all computed by the SECURITY DEFINER log_activity()
+// function (prisma/superuser/) so application code cannot forge them.
 model ActivityLog {
   id             String              @id @default(dbgenerated("uuidv7()")) @db.Uuid
   organizationId String              @map("organization_id") @db.Uuid
@@ -320,6 +322,10 @@ model ActivityLog {
   afterJson      Json?               @map("after_json")
   reason         String?
   createdAt      DateTime            @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// F6 hash chain (#13), all set by log_activity(): per-org dense position + linked SHA-256 hashes.
+  chainSeq       BigInt?             @map("chain_seq")
+  prevHash       String?             @map("prev_hash")
+  rowHash        String?             @map("row_hash")
 
   organization Organization @relation(fields: [organizationId], references: [id])
 
