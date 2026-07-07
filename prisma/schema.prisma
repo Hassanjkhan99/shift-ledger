@@ -3,6 +3,15 @@
 // organization_id on every tenant-scoped table, timestamptz, soft-delete via deleted_at
 // (except append-only tables). RLS + FORCE, policies, and the activity_log append-only
 // trigger are applied via raw SQL in a follow-up migration (Prisma cannot express them).
+//
+// TENANT-QUALIFIED (COMPOSITE) FOREIGN KEYS (#94): the cross-row FKs on scheduled_tasks,
+// task_occurrences, task_completions, evidence, exceptions, and corrective_actions are
+// COMPOSITE — (organization_id, <ref_id>) -> parent(organization_id, id) — so a row in org A
+// cannot reference a parent row belonging to another org (Postgres FK checks bypass RLS). The
+// composite FKs are a DB-level integrity constraint only and live ONLY in the migration
+// 20260706130000_composite_fk_tenant; the model @relation definitions below stay SINGLE-COLUMN
+// (queries use the scalar _id fields), so `prisma migrate dev` drift against them is expected/known
+// — same convention as the partial index / CHECK constraints that also live only in migrations.
 
 generator client {
   provider = "prisma-client"
