@@ -62,6 +62,7 @@ async function makeChain(orgId: string): Promise<{
         occurrenceLocalDate: new Date(Date.UTC(2026, 6, Math.floor(Math.random() * 27) + 1)),
         dueAt: new Date("2026-07-03T04:00:00Z"),
         timezone: "Europe/Berlin",
+        assigneeRole: "KitchenManager",
       },
       select: { id: true },
     });
@@ -95,6 +96,7 @@ describe("#94 composite tenant-qualified FKs", () => {
             occurrenceLocalDate: new Date(Date.UTC(2026, 7, 1)),
             dueAt: new Date("2026-08-01T04:00:00Z"),
             timezone: "Europe/Berlin",
+            assigneeRole: "KitchenManager",
           },
         }),
       ),

@@ -53,6 +53,7 @@ async function makeOccurrence(orgId: string): Promise<{ occurrenceId: string; us
         occurrenceLocalDate: new Date(Date.UTC(2026, 6, 3)),
         dueAt: new Date("2026-07-03T04:00:00Z"),
         timezone: "Europe/Berlin",
+        assigneeRole: "KitchenManager",
       },
       select: { id: true },
     });
