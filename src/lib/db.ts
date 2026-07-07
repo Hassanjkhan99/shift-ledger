@@ -7,27 +7,49 @@ import { Pool } from "pg";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "../generated/prisma/client";
 
-const connectionString = process.env.DATABASE_URL;
-if (!connectionString) {
-  throw new Error("DATABASE_URL is not set");
-}
-
 // Own the pg Pool explicitly so it can be closed cleanly (a Prisma 7 driver adapter does
 // not close a pool it was handed; leaving it open keeps the process alive).
 const globalForPrisma = globalThis as unknown as { prisma?: PrismaClient; pgPool?: Pool };
 
-const pool = globalForPrisma.pgPool ?? new Pool({ connectionString });
-const adapter = new PrismaPg(pool);
-export const prisma = globalForPrisma.prisma ?? new PrismaClient({ adapter });
-if (process.env.NODE_ENV !== "production") {
-  globalForPrisma.prisma = prisma;
-  globalForPrisma.pgPool = pool;
+// LAZY init: the client/pool are created on FIRST use, not at module load. `next build` imports every
+// API route module to collect page data, and those routes import this file — but the build environment
+// has no DATABASE_URL. Throwing at import time would fail the build; deferring it means importing db.ts
+// is side-effect-free and DATABASE_URL is only required when a query actually runs (request/test time).
+let poolInstance: Pool | undefined;
+let prismaInstance: PrismaClient | undefined;
+
+function client(): PrismaClient {
+  if (prismaInstance) return prismaInstance;
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("DATABASE_URL is not set");
+  }
+  poolInstance = globalForPrisma.pgPool ?? new Pool({ connectionString });
+  prismaInstance =
+    globalForPrisma.prisma ?? new PrismaClient({ adapter: new PrismaPg(poolInstance) });
+  if (process.env.NODE_ENV !== "production") {
+    globalForPrisma.prisma = prismaInstance;
+    globalForPrisma.pgPool = poolInstance;
+  }
+  return prismaInstance;
 }
+
+/**
+ * The Prisma client. A lazy Proxy: importing it is side-effect-free (safe at `next build`), and the
+ * real client + pool are created on the first property access (when DATABASE_URL is available).
+ */
+export const prisma = new Proxy({} as PrismaClient, {
+  get(_target, prop) {
+    const c = client() as unknown as Record<string | symbol, unknown>;
+    const value = c[prop];
+    return typeof value === "function" ? (value as (...a: unknown[]) => unknown).bind(c) : value;
+  },
+});
 
 /** Close the Prisma client and the underlying pg pool (used by tests / graceful shutdown). */
 export async function disconnect(): Promise<void> {
-  await prisma.$disconnect().catch(() => {});
-  await pool.end().catch(() => {});
+  await prismaInstance?.$disconnect().catch(() => {});
+  await poolInstance?.end().catch(() => {});
 }
 
 export type TenantClient = Parameters<Parameters<PrismaClient["$transaction"]>[0]>[0];
@@ -46,7 +68,7 @@ export function withTenant<T>(
   organizationId: string,
   fn: (tx: TenantClient) => Promise<T>,
 ): Promise<T> {
-  return prisma.$transaction(async (tx) => {
+  return client().$transaction(async (tx) => {
     await tx.$executeRaw`SELECT set_config('app.current_org_id', ${organizationId}, true)`;
     // Pin the session timezone to UTC for this transaction. All compliance timestamps are stored
     // and compared as UTC instants (F3); without this, a server-set timestamptz (e.g. a BEFORE
