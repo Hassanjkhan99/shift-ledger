@@ -409,6 +409,9 @@ model TaskOccurrence {
   dueAt               DateTime         @map("due_at") @db.Timestamptz(6)
   timezone            String
   status              OccurrenceStatus @default(pending)
+  // Exactly one of (assigneeRole, assigneeUserId) is non-null — enforced by the
+  // task_occurrences_assignee_xor CHECK in migration 20260706150000_occurrence_assignee_xor
+  // (Prisma cannot express a XOR CHECK; mirrors scheduled_tasks). #98.
   assigneeRole        OrgRole?         @map("assignee_role")
   assigneeUserId      String?          @map("assignee_user_id") @db.Uuid
   completedAt         DateTime?        @map("completed_at") @db.Timestamptz(6)

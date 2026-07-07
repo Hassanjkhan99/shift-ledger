@@ -84,6 +84,7 @@ async function seedOccurrence(
         dueAt: new Date("2026-07-03T04:00:00Z"),
         timezone: "Europe/Berlin",
         status,
+        assigneeRole: "KitchenManager",
       },
       select: { id: true },
     });

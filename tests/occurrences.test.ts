@@ -358,6 +358,7 @@ describe("sweepOccurrences", () => {
       taskTemplateId: tpl,
       checkType: "temperature" as const,
       timezone: "Europe/Berlin",
+      assigneeRole: "KitchenManager" as const,
     };
     const ids = await withTenant(orgAId, async (tx) => {
       const future = await tx.taskOccurrence.create({
@@ -578,6 +579,7 @@ describe("sweepOccurrences — compare-and-set + tombstone safety", () => {
       taskTemplateId: tpl,
       checkType: "temperature" as const,
       timezone: "Europe/Berlin",
+      assigneeRole: "KitchenManager" as const,
     };
 
     // A pending row that is already completed in the DB but whose STATUS the sweep will try to
@@ -969,6 +971,7 @@ describe("sweepOccurrences — CAS updateMany also filters deletedAt: null", () 
       taskTemplateId: tpl,
       checkType: "temperature" as const,
       timezone: "Europe/Berlin",
+      assigneeRole: "KitchenManager" as const,
     };
 
     // A pending and a due row, BOTH past due/grace and BOTH soft-deleted. The sweep's READ excludes
@@ -1022,5 +1025,83 @@ describe("sweepOccurrences — CAS updateMany also filters deletedAt: null", () 
       }),
     );
     expect(logs).toHaveLength(0);
+  });
+});
+
+// ---- Assignee XOR CHECK (#98) ---------------------------------------------------
+// task_occurrences must carry EXACTLY ONE resolved assignee (role XOR user), mirroring
+// scheduled_tasks. Enforced by the task_occurrences_assignee_xor CHECK.
+describe("task_occurrences assignee XOR (#98)", () => {
+  it("rejects both-null, rejects both-set, accepts exactly one", async () => {
+    const siteA = await siteFor(orgAId);
+    const tpl = await makeTemplate(orgAId, "Assignee XOR check #98");
+    const st = await makeSchedule(
+      orgAId,
+      { ...siteA, templateId: tpl },
+      { freq: "daily", interval: 1, timeOfDay: "06:00" },
+      { timezone: "Europe/Berlin", startsOn: new Date(Date.UTC(2026, 0, 1)) },
+    );
+    const memberUserId = await withTenant(orgAId, (tx) =>
+      tx.membership.findFirstOrThrow({ select: { userId: true } }).then((m) => m.userId),
+    );
+    const base = {
+      organizationId: orgAId,
+      propertyId: siteA.propertyId,
+      outletId: siteA.outletId,
+      scheduledTaskId: st,
+      taskTemplateId: tpl,
+      checkType: "temperature" as const,
+      dueAt: new Date("2027-03-01T04:00:00Z"),
+      timezone: "Europe/Berlin",
+    };
+
+    // Neither assignee set → CHECK rejects.
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.taskOccurrence.create({
+          data: { ...base, occurrenceLocalDate: new Date(Date.UTC(2027, 2, 1)) },
+        }),
+      ),
+    ).rejects.toThrow();
+
+    // BOTH assignees set → CHECK rejects (user is a real org-A member, so only the XOR bites).
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.taskOccurrence.create({
+          data: {
+            ...base,
+            occurrenceLocalDate: new Date(Date.UTC(2027, 2, 2)),
+            assigneeRole: "KitchenManager",
+            assigneeUserId: memberUserId,
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+
+    // Exactly one (role only) → succeeds.
+    const roleOnly = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.create({
+        data: {
+          ...base,
+          occurrenceLocalDate: new Date(Date.UTC(2027, 2, 3)),
+          assigneeRole: "KitchenManager",
+        },
+        select: { id: true },
+      }),
+    );
+    expect(roleOnly.id).toBeTruthy();
+
+    // Exactly one (user only) → succeeds.
+    const userOnly = await withTenant(orgAId, (tx) =>
+      tx.taskOccurrence.create({
+        data: {
+          ...base,
+          occurrenceLocalDate: new Date(Date.UTC(2027, 2, 4)),
+          assigneeUserId: memberUserId,
+        },
+        select: { id: true },
+      }),
+    );
+    expect(userOnly.id).toBeTruthy();
   });
 });
