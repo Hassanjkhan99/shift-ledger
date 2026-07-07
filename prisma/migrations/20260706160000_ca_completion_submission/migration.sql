@@ -1,0 +1,11 @@
+-- #96: corrective-action completion idempotency (F2).
+-- Adds a nullable client_submission_id to corrective_actions so an offline-queue retry of a
+-- successful markDone can be recognized as an idempotent replay instead of throwing an
+-- illegal-transition error (done -> done). markCorrectiveActionDone stores the client-supplied id
+-- alongside completed_by/completed_at; a re-entry from `done`/`verified` with the SAME stored id
+-- returns the existing row without a second audit row or re-running the resolve cascade.
+--
+-- Nullable + no backfill: existing CAs and any markDone call without a clientSubmissionId leave the
+-- column NULL (a NULL stored id never matches a supplied id, so a genuine done->done conflict still
+-- throws). No RLS change needed -- the column rides the existing corrective_actions policies.
+ALTER TABLE "corrective_actions" ADD COLUMN "completion_submission_id" uuid;

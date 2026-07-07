@@ -58,6 +58,23 @@ function jsonSafe(value: unknown): Prisma.InputJsonValue | null {
   return value as Prisma.InputJsonValue;
 }
 
+/**
+ * Serialize a per-exception cascade against concurrent transactions (#96).
+ *
+ * Both couple-cascades (assign's acknowledged→in_progress start, markDone's in_progress→resolved
+ * resolve) READ the parent exception's state and then conditionally advance it. Two interleaved
+ * transactions can therefore race: e.g. two CAs marked `done` in parallel each count "remaining"
+ * before the other commits, both see >0, and neither resolves the parent — it stays `in_progress`
+ * with all work done. Taking a `FOR UPDATE` row lock on the parent at the START of the cascade (and
+ * re-reading its state under the lock) makes the cascades serialize: the second transaction blocks
+ * on the lock until the first commits, then observes the committed state. RLS-scoped by the
+ * withTenant GUC, so the lock only ever targets the current tenant's row. The lock is held to commit
+ * because everything stays inside the caller's `tx` (the withTenant transaction).
+ */
+async function lockException(tx: TenantClient, exceptionId: string): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM exceptions WHERE id = ${exceptionId}::uuid FOR UPDATE`;
+}
+
 /** Throw a clear error if `current` is not a legal `from` for `edge`. */
 function assertFrom<S extends string>(
   entity: string,
@@ -566,11 +583,18 @@ export async function assignCorrectiveAction(
     },
   );
 
-  // Cascade: first CA activated on an acknowledged exception → in_progress.
+  // Cascade: first CA activated on an acknowledged exception → in_progress. Lock the parent first
+  // (#96) so two concurrent assigns on the same acknowledged parent serialize: the loser blocks on
+  // the lock, then re-reads the parent as already `in_progress` and SKIPS the start cascade (below)
+  // rather than losing the throwing CAS and rolling back an otherwise-valid assignment.
+  await lockException(tx, result.exceptionId);
   const parent = await tx.exception.findUniqueOrThrow({
     where: { id: result.exceptionId },
     select: { status: true },
   });
+  // Idempotent start: cascade acknowledged→in_progress ONLY if still acknowledged. If a concurrent
+  // assign already advanced it to in_progress, that IS the intended end state — treat as success and
+  // skip (do not call the throwing exceptionEdge CAS, which would roll back this valid assignment).
   if (parent.status === ExceptionStatus.acknowledged) {
     await exceptionEdge(
       tx,
@@ -585,14 +609,32 @@ export async function assignCorrectiveAction(
   return { id: result.id, status: result.status };
 }
 
+/** Options for markCorrectiveActionDone. */
+export interface MarkCorrectiveActionDoneOptions {
+  /**
+   * F2 (#96) idempotency key. The D9 offline write-queue re-sends a `done` submission with the SAME
+   * client-generated id when its ACK was lost. When supplied, it is persisted alongside
+   * completed_by/at; a later re-entry from `done`/`verified` carrying the SAME stored id is a known
+   * replay → returns the existing row (no second audit row, no re-cascade). A retry with a DIFFERENT
+   * or absent id against a `done` CA is a genuine conflict and still throws the illegal transition.
+   */
+  clientSubmissionId?: string;
+}
+
 /**
  * assigned → done. Sets completed_by/at. If ALL non-deleted CAs on the parent exception are now
  * `done`, cascade the exception in_progress → resolved (§7.2) in the same tx ('system:cascade').
+ *
+ * F2 idempotency (#96): pass `opts.clientSubmissionId` from the offline write-queue. If the CA is
+ * already `done`/`verified` AND its stored completion_submission_id equals the supplied id (both
+ * non-null), this is an idempotent replay: return the existing row WITHOUT throwing, without a
+ * second audit row, and without re-running the resolve cascade.
  */
 export async function markCorrectiveActionDone(
   tx: TenantClient,
   correctiveActionId: string,
   actor: Actor,
+  opts?: MarkCorrectiveActionDoneOptions,
 ): Promise<{ id: string; status: CorrectiveStatus }> {
   // Completion must be attributable to a real user: completedBy is the accountable person. A system
   // actor (actorLabel only) would store `done` with a null completedBy, losing attribution — reject.
@@ -601,6 +643,27 @@ export async function markCorrectiveActionDone(
       "markCorrectiveActionDone: a user actor (actorUserId) is required — completion must be attributable",
     );
   }
+
+  // F2 idempotent-replay short-circuit (#96): an offline-queue retry re-enters from `done`/`verified`.
+  // If the stored completion_submission_id matches the supplied clientSubmissionId (both non-null),
+  // the original completion already succeeded — return that row unchanged (no throwing correctiveEdge,
+  // no second audit row, no re-cascade). A different/absent id against a `done` CA falls through to
+  // correctiveEdge, which throws the illegal transition (that is a genuine conflict, not a replay).
+  if (opts?.clientSubmissionId) {
+    const existing = await tx.correctiveAction.findUniqueOrThrow({
+      where: { id: correctiveActionId },
+      select: { status: true, completionSubmissionId: true },
+    });
+    if (
+      (existing.status === CorrectiveStatus.done ||
+        existing.status === CorrectiveStatus.verified) &&
+      existing.completionSubmissionId !== null &&
+      existing.completionSubmissionId === opts.clientSubmissionId
+    ) {
+      return { id: correctiveActionId, status: existing.status };
+    }
+  }
+
   const result = await correctiveEdge(
     tx,
     correctiveActionId,
@@ -608,10 +671,21 @@ export async function markCorrectiveActionDone(
     CorrectiveStatus.done,
     "corrective.done",
     actor,
-    { completedBy: actor.actorUserId, completedAt: new Date() },
+    {
+      completedBy: actor.actorUserId,
+      completedAt: new Date(),
+      // Persist the idempotency key in the same update so a later replay can recognize this
+      // completion. Omitting the key leaves the column NULL (a NULL never matches a supplied id).
+      ...(opts?.clientSubmissionId ? { completionSubmissionId: opts.clientSubmissionId } : {}),
+    },
   );
 
   // Cascade: last CA done on the parent → resolve the exception (only when it is in_progress).
+  // Lock the parent first (#96) so two CAs marked done in parallel serialize: the loser blocks on
+  // the lock, then re-counts remaining under the lock and — seeing the winner's `done` committed —
+  // observes zero remaining and resolves. Without the lock both could count remaining>0 and neither
+  // would resolve, leaving the parent stuck in_progress with all work complete.
+  await lockException(tx, result.exceptionId);
   // A CA that already advanced done → verified counts as complete too, so remaining excludes BOTH
   // `done` AND `verified` — otherwise a CA verified before the last one finishes would wrongly
   // keep the parent from auto-resolving.
