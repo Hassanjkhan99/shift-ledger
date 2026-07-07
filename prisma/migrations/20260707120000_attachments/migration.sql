@@ -35,7 +35,13 @@ CREATE TABLE "attachments" (
     -- an "uploaded but unverifiable" attachment unrepresentable at the DB level, independent of the
     -- app finalize path (#106) - reinforcing #106's fail-closed guarantee.
     CONSTRAINT "attachments_uploaded_requires_checksum"
-      CHECK ("status" <> 'uploaded' OR ("checksum_sha256" IS NOT NULL AND "byte_size" IS NOT NULL))
+      CHECK ("status" <> 'uploaded' OR ("checksum_sha256" IS NOT NULL AND "byte_size" IS NOT NULL)),
+    -- Tenant boundary (defense in depth): the R2 key MUST live under this row's own org prefix
+    -- (org/{organization_id}/..., per §10.5). RLS scopes the ROW to its org, but nothing else stops the
+    -- key text from pointing into ANOTHER tenant's prefix - which the signed-GET path (#107) would then
+    -- mint access for. Evidence keys (#105) and export-pack keys (#14) are all org-prefixed by design.
+    CONSTRAINT "attachments_r2_key_org_prefixed"
+      CHECK ("r2_key" LIKE ('org/' || "organization_id"::text || '/%'))
 );
 
 -- ============================================================================
@@ -69,6 +75,44 @@ ALTER TABLE "attachments" FORCE ROW LEVEL SECURITY;
 CREATE POLICY "tenant_isolation" ON "attachments"
   USING ("organization_id" = NULLIF(current_setting('app.current_org_id', true), '')::uuid)
   WITH CHECK ("organization_id" = NULLIF(current_setting('app.current_org_id', true), '')::uuid);
+
+-- ============================================================================
+-- Finalize integrity guard (F6): attachments are mutable, but the object POINTER and its integrity
+-- proof are write-once. Once immutable evidence references an uploaded object, its checksum/size/key
+-- must never silently change underneath the audit trail. This BEFORE UPDATE trigger allows exactly the
+-- two legitimate mutations - the pending -> uploaded finalize (#106, which sets checksum + byte_size)
+-- and the soft-delete tombstone (deleted_at) - and rejects everything else:
+--   * organization_id / r2_bucket / r2_key are immutable (the object pointer never moves);
+--   * status is one-way (uploaded can never revert to pending);
+--   * checksum_sha256 / byte_size are write-once (NULL -> value at finalize, then frozen).
+-- (INSERT is unconstrained; the CHECKs above already gate a new row's shape.)
+CREATE OR REPLACE FUNCTION guard_attachment_update() RETURNS trigger AS $$
+BEGIN
+  IF NEW."organization_id" <> OLD."organization_id"
+     OR NEW."r2_bucket" <> OLD."r2_bucket"
+     OR NEW."r2_key" <> OLD."r2_key" THEN
+    RAISE EXCEPTION 'attachments: organization_id / r2_bucket / r2_key are immutable'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF OLD."status" = 'uploaded' AND NEW."status" <> 'uploaded' THEN
+    RAISE EXCEPTION 'attachments: status cannot revert from uploaded'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF OLD."checksum_sha256" IS NOT NULL AND NEW."checksum_sha256" IS DISTINCT FROM OLD."checksum_sha256" THEN
+    RAISE EXCEPTION 'attachments: checksum_sha256 is write-once'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  IF OLD."byte_size" IS NOT NULL AND NEW."byte_size" IS DISTINCT FROM OLD."byte_size" THEN
+    RAISE EXCEPTION 'attachments: byte_size is write-once'
+      USING ERRCODE = 'restrict_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER "attachments_guard_update"
+  BEFORE UPDATE ON "attachments"
+  FOR EACH ROW EXECUTE FUNCTION guard_attachment_update();
 
 -- ============================================================================
 -- evidence.attachment_id -> attachments (the FK deferred in 20260703140000_completions_evidence).
@@ -108,3 +152,10 @@ ALTER TABLE "evidence"
     AND ("type" <> 'checkbox' OR "value_bool" IS NOT NULL)
     AND ("type" NOT IN ('note', 'initials') OR "value_text" IS NOT NULL)
   );
+
+-- Signature evidence must carry SOME proof: an attachment (drawn) OR value_text (typed initials/name).
+-- The DB cannot tell drawn from typed (that lives in the app via requiresAttachment()), but it can fail
+-- closed by rejecting a signature row with NEITHER - an empty, immutable sign-off is worthless as proof.
+ALTER TABLE "evidence"
+  ADD CONSTRAINT "evidence_signature_requires_proof"
+  CHECK ("type" <> 'signature' OR "attachment_id" IS NOT NULL OR "value_text" IS NOT NULL);

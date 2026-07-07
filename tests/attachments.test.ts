@@ -236,6 +236,34 @@ describe("evidence CHECKs — D4 attachment rule + value shape", () => {
     await expect(bad({ type: "initials" })).rejects.toThrow(); // no value_text
   });
 
+  it("a signature with neither an attachment nor value_text is rejected (fail-closed proof)", async () => {
+    const { completionId } = await makeCompletion(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.evidence.create({
+          data: { organizationId: orgAId, taskCompletionId: completionId, type: "signature" },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("a drawn signature (attachment, no value_text) is accepted", async () => {
+    const { completionId } = await makeCompletion(orgAId);
+    const attachmentId = await makeAttachment(orgAId);
+    const ev = await withTenant(orgAId, (tx) =>
+      tx.evidence.create({
+        data: {
+          organizationId: orgAId,
+          taskCompletionId: completionId,
+          type: "signature",
+          attachmentId,
+        },
+        select: { id: true },
+      }),
+    );
+    expect(ev.id).toBeTruthy();
+  });
+
   it("valid typed evidence rows are accepted (temperature, checkbox, initials, typed signature)", async () => {
     const { completionId } = await makeCompletion(orgAId);
     const ok = (data: Record<string, unknown>) =>
@@ -269,5 +297,87 @@ describe("evidence → attachment tenant-qualified composite FK", () => {
         }),
       ),
     ).rejects.toThrow();
+  });
+});
+
+describe("attachments — r2_key must live under the row's org prefix", () => {
+  it("rejects an r2_key that is not org-prefixed for this row's organization", async () => {
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.create({
+          data: {
+            organizationId: orgAId,
+            r2Bucket: "shift-ledger-eu",
+            r2Key: `org/${orgBId}/evidence/${randomUUID()}`, // another tenant's prefix
+            contentType: "image/jpeg",
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+});
+
+describe("attachments — finalize write-once guard (F6)", () => {
+  it("allows the pending→uploaded finalize (checksum + byte_size set once)", async () => {
+    const id = await makeAttachment(orgAId);
+    const finalized = await withTenant(orgAId, (tx) =>
+      tx.attachment.update({
+        where: { id },
+        data: { status: "uploaded", byteSize: BigInt(1024), checksumSha256: "a".repeat(64) },
+        select: { status: true, checksumSha256: true },
+      }),
+    );
+    expect(finalized.status).toBe("uploaded");
+    expect(finalized.checksumSha256).toBe("a".repeat(64));
+  });
+
+  it("rejects reverting status from uploaded back to pending", async () => {
+    const id = await makeAttachment(orgAId);
+    await withTenant(orgAId, (tx) =>
+      tx.attachment.update({
+        where: { id },
+        data: { status: "uploaded", byteSize: BigInt(1024), checksumSha256: "b".repeat(64) },
+      }),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.update({ where: { id }, data: { status: "pending" } }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects rewriting a checksum once set, and rejects moving the r2_key", async () => {
+    const id = await makeAttachment(orgAId);
+    await withTenant(orgAId, (tx) =>
+      tx.attachment.update({
+        where: { id },
+        data: { status: "uploaded", byteSize: BigInt(1024), checksumSha256: "c".repeat(64) },
+      }),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.update({ where: { id }, data: { checksumSha256: "d".repeat(64) } }),
+      ),
+    ).rejects.toThrow();
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.update({
+          where: { id },
+          data: { r2Key: `org/${orgAId}/evidence/${randomUUID()}` },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("still allows the soft-delete tombstone (deleted_at)", async () => {
+    const id = await makeAttachment(orgAId);
+    const tombstoned = await withTenant(orgAId, (tx) =>
+      tx.attachment.update({
+        where: { id },
+        data: { deletedAt: new Date() },
+        select: { deletedAt: true },
+      }),
+    );
+    expect(tombstoned.deletedAt).not.toBeNull();
   });
 });
