@@ -137,6 +137,16 @@ enum CorrectiveStatus {
   @@map("corrective_status")
 }
 
+// ExportJob lifecycle (§7.4, #14). queued -> processing -> completed | failed. Driven via transition().
+enum ExportJobStatus {
+  queued
+  processing
+  completed
+  failed
+
+  @@map("export_job_status")
+}
+
 enum ActivitySubjectType {
   organization
   property
@@ -183,6 +193,7 @@ model User {
   correctiveActionsAssigned   CorrectiveAction[] @relation("CorrectiveActionAssignee")
   correctiveActionsCompleted  CorrectiveAction[] @relation("CorrectiveActionCompletedBy")
   correctiveActionsVerified   CorrectiveAction[] @relation("CorrectiveActionVerifiedBy")
+  exportJobsRequested         ExportJob[]        @relation("ExportJobRequestedBy")
 
   @@map("users")
 }
@@ -215,6 +226,8 @@ model Organization {
   attachments     Attachment[]
   exceptions       Exception[]
   correctiveActions CorrectiveAction[]
+  exportJobs      ExportJob[]
+  auditPacks      AuditPack[]
 
   @@map("organizations")
 }
@@ -551,10 +564,60 @@ model Attachment {
   organization   Organization @relation(fields: [organizationId], references: [id])
   uploadedByUser User?        @relation("AttachmentUploadedBy", fields: [uploadedBy], references: [id])
   evidence       Evidence[]
+  auditPacks     AuditPack[]
 
   @@unique([r2Bucket, r2Key])
   @@index([organizationId, status])
   @@map("attachments")
+}
+
+// ---- Export jobs + audit packs (#14; §8.22 export_jobs, §8.23 audit_packs) -------
+// export_jobs is a MUTABLE state machine (§7.4) driven through transition(). audit_packs is
+// effectively immutable; its PDF/CSV lives in R2 via an attachments row. Composite tenant FKs (#94) +
+// requested_by membership FK (#95) live ONLY in the 20260707150000 migration.
+model ExportJob {
+  id             String          @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId String          @map("organization_id") @db.Uuid
+  status         ExportJobStatus @default(queued)
+  requestedBy    String          @map("requested_by") @db.Uuid
+  filtersJson    Json            @default("{}") @map("filters_json")
+  auditPackId    String?         @map("audit_pack_id") @db.Uuid
+  error          String?
+  createdAt      DateTime        @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt      DateTime        @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  organization    Organization @relation(fields: [organizationId], references: [id])
+  requestedByUser User         @relation("ExportJobRequestedBy", fields: [requestedBy], references: [id])
+  auditPack       AuditPack?   @relation("ExportJobAuditPack", fields: [auditPackId], references: [id])
+  producedPack    AuditPack[]  @relation("AuditPackExportJob")
+
+  @@unique([organizationId, id])
+  @@index([organizationId, status])
+  @@map("export_jobs")
+}
+
+model AuditPack {
+  id                  String   @id @default(dbgenerated("uuidv7()")) @db.Uuid
+  organizationId      String   @map("organization_id") @db.Uuid
+  exportJobId         String   @map("export_job_id") @db.Uuid
+  attachmentId        String   @map("attachment_id") @db.Uuid
+  recordCount         Int      @default(0) @map("record_count")
+  filtersSnapshotJson Json     @default("{}") @map("filters_snapshot_json")
+  /// activity_log row_hash at export time (F6, from activity_chain_head()); proves scope integrity.
+  chainHeadHash       String?  @map("chain_head_hash")
+  generatedAt         DateTime @default(now()) @map("generated_at") @db.Timestamptz(6)
+  createdAt           DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+  exportJob    ExportJob    @relation("AuditPackExportJob", fields: [exportJobId], references: [id])
+  attachment   Attachment   @relation(fields: [attachmentId], references: [id])
+  jobsPointing ExportJob[]  @relation("ExportJobAuditPack")
+
+  @@unique([organizationId, id])
+  @@unique([exportJobId])
+  @@index([organizationId, generatedAt])
+  @@index([organizationId, exportJobId])
+  @@map("audit_packs")
 }
 
 // ---- Exceptions + corrective actions (#9; §8.17 exceptions, §8.18 corrective_actions) -----------

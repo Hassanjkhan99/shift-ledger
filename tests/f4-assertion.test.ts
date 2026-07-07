@@ -42,7 +42,12 @@ import { join } from "node:path";
 // of these basenames (e.g. src/app/api/occurrences.ts) is NOT sanctioned — its status writes are
 // flagged unconditionally (the marker is only honoured inside these paths), so a real bypass there
 // cannot slip past this guard.
-const SANCTIONED = ["src/lib/transition.ts", "src/lib/occurrences.ts", "src/lib/exceptions.ts"];
+const SANCTIONED = [
+  "src/lib/transition.ts",
+  "src/lib/occurrences.ts",
+  "src/lib/exceptions.ts",
+  "src/lib/exports.ts",
+];
 
 /** Repo-relative, forward-slash-normalized path for `file` (an absolute path under process.cwd()). */
 function relPath(file: string): string {
