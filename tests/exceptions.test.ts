@@ -1178,6 +1178,179 @@ describe("cascades (§7.2)", () => {
     expect(resolved.status).toBe("resolved");
   });
 
+  // ---- #96: concurrency serialization + F2 corrective-action completion idempotency ----------
+  it("F2: markDone replay with the same clientSubmissionId returns the same CA, one audit row, resolves once", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "sole CA" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+
+    const submissionId = randomUUID();
+    const first = await withTenant(orgAId, (tx) =>
+      markCorrectiveActionDone(
+        tx,
+        ca.id,
+        { actorUserId: userId },
+        { clientSubmissionId: submissionId },
+      ),
+    );
+    expect(first.status).toBe("done");
+
+    // Sole CA done → parent auto-resolved.
+    let ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("resolved");
+
+    // Replay with the SAME id → idempotent: same CA, still done, no throw.
+    const replay = await withTenant(orgAId, (tx) =>
+      markCorrectiveActionDone(
+        tx,
+        ca.id,
+        { actorUserId: userId },
+        { clientSubmissionId: submissionId },
+      ),
+    );
+    expect(replay.id).toBe(first.id);
+    expect(replay.status).toBe("done");
+
+    // Exactly ONE corrective.done audit row and ONE exception.resolved cascade — no second write.
+    expect(await logsFor(orgAId, ca.id, { action: "corrective.done" })).toHaveLength(1);
+    expect(await logsFor(orgAId, exceptionId, { action: "exception.resolved" })).toHaveLength(1);
+
+    ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("resolved");
+
+    // A done→done retry with a DIFFERENT/absent id is a genuine conflict → still throws.
+    await expect(
+      withTenant(orgAId, (tx) =>
+        markCorrectiveActionDone(
+          tx,
+          ca.id,
+          { actorUserId: userId },
+          {
+            clientSubmissionId: randomUUID(),
+          },
+        ),
+      ),
+    ).rejects.toThrow(/illegal transition/i);
+    await expect(
+      withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca.id, { actorUserId: userId })),
+    ).rejects.toThrow(/illegal transition/i);
+  });
+
+  it("start-cascade idempotency: two concurrent assigns on an acknowledged parent both succeed, parent ends in_progress", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca1 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "CA1" }, { actorUserId: userId }),
+    );
+    const ca2 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "CA2" }, { actorUserId: userId }),
+    );
+
+    // Two SEPARATE withTenant transactions racing the acknowledged→in_progress start cascade. The
+    // FOR UPDATE parent lock serializes them: the loser re-reads the parent as already in_progress
+    // and SKIPS the throwing CAS, so BOTH assignments commit (neither rolls back).
+    const results = await Promise.all([
+      withTenant(orgAId, (tx) =>
+        assignCorrectiveAction(
+          tx,
+          ca1.id,
+          { assigneeUserId: userId, dueAt: DUE },
+          { actorUserId: userId },
+        ),
+      ),
+      withTenant(orgAId, (tx) =>
+        assignCorrectiveAction(
+          tx,
+          ca2.id,
+          { assigneeUserId: userId, dueAt: DUE },
+          { actorUserId: userId },
+        ),
+      ),
+    ]);
+    expect(results.map((r) => r.status)).toEqual(["assigned", "assigned"]);
+
+    // Both CAs actually persisted as assigned (no rolled-back assignment).
+    const rows = await withTenant(orgAId, (tx) =>
+      tx.correctiveAction.findMany({
+        where: { id: { in: [ca1.id, ca2.id] } },
+        select: { status: true },
+      }),
+    );
+    expect(rows.map((r) => r.status).sort()).toEqual(["assigned", "assigned"]);
+
+    const ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("in_progress");
+    // The start cascade fired exactly once.
+    expect(
+      await logsFor(orgAId, exceptionId, {
+        action: "exception.started",
+        actorLabel: "system:cascade",
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("resolve serialization: two CAs marked done concurrently resolve the parent exactly once", async () => {
+    const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
+    const ca1 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "CA1" }, { actorUserId: userId }),
+    );
+    const ca2 = await withTenant(orgAId, (tx) =>
+      createCorrectiveAction(tx, { exceptionId, description: "CA2" }, { actorUserId: userId }),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca1.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    await withTenant(orgAId, (tx) =>
+      assignCorrectiveAction(
+        tx,
+        ca2.id,
+        { assigneeUserId: userId, dueAt: DUE },
+        { actorUserId: userId },
+      ),
+    );
+    // Parent is now in_progress with two `assigned` CAs.
+
+    // Mark BOTH done in two SEPARATE withTenant transactions racing the resolve cascade. The FOR
+    // UPDATE parent lock serializes them: whichever completes the last CA re-counts remaining=0 under
+    // the lock and resolves. Without the lock both could see remaining>0 and leave the parent stuck.
+    await Promise.all([
+      withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca1.id, { actorUserId: userId })),
+      withTenant(orgAId, (tx) => markCorrectiveActionDone(tx, ca2.id, { actorUserId: userId })),
+    ]);
+
+    const ex = await withTenant(orgAId, (tx) =>
+      tx.exception.findUniqueOrThrow({ where: { id: exceptionId } }),
+    );
+    expect(ex.status).toBe("resolved"); // not stuck in_progress
+    expect(ex.resolvedAt).not.toBeNull();
+    // Resolved exactly once.
+    expect(
+      await logsFor(orgAId, exceptionId, {
+        action: "exception.resolved",
+        actorLabel: "system:cascade",
+      }),
+    ).toHaveLength(1);
+  });
+
   it("a soft-deleted corrective action cannot be transitioned and does not count toward auto-resolve", async () => {
     const { exceptionId, userId } = await makeAcknowledgedException(orgAId);
     const ca1 = await withTenant(orgAId, (tx) =>

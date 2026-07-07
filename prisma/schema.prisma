@@ -561,6 +561,11 @@ model CorrectiveAction {
   completedAt    DateTime?        @map("completed_at") @db.Timestamptz(6)
   verifiedBy     String?          @map("verified_by") @db.Uuid
   verifiedAt     DateTime?        @map("verified_at") @db.Timestamptz(6)
+  // F2 (#96): client-supplied idempotency key for the markDone completion. An offline-queue retry
+  // that re-sends `done` with the SAME id is recognized as an idempotent replay (returns the row,
+  // no second audit / no re-cascade); NULL means no key was supplied (a done→done retry then still
+  // throws the illegal transition — a genuine conflict, not a known replay).
+  completionSubmissionId String?   @map("completion_submission_id") @db.Uuid
   createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(6)
   deletedAt      DateTime?        @map("deleted_at") @db.Timestamptz(6)
