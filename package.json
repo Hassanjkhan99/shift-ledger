@@ -14,6 +14,7 @@
     "prisma:generate": "prisma generate",
     "migrate": "prisma migrate dev",
     "migrate:deploy": "prisma migrate deploy",
+    "migrate:superuser": "node scripts/apply-superuser.mjs",
     "seed": "tsx prisma/seed.ts",
     "test": "vitest run",
     "prepare": "husky"
