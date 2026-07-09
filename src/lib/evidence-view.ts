@@ -13,21 +13,25 @@ export interface EvidenceViewUrl {
 }
 
 /**
- * Resolve a short-lived signed GET URL for an uploaded attachment the current tenant may view, or null
- * when it is not visible (cross-tenant / not found by RLS), not yet uploaded, or soft-deleted. Null ->
- * the route returns a 404-style non-disclosure (never confirms the object exists).
+ * Resolve a short-lived signed GET URL for the attachment behind an EVIDENCE row the current tenant may
+ * view (the documented `GET /evidence/:id/view` uses the Evidence id, §11.9 — #119), or null when the
+ * evidence is not visible (cross-tenant / not found by RLS), carries no attachment, or that attachment
+ * is not a live uploaded object. Resolving via the evidence row (not a bare attachment id) means an
+ * attachment can only be viewed when it is actually linked to visible evidence. Null -> the route
+ * returns a 404-style non-disclosure (never confirms the object exists).
  */
-export async function resolveAttachmentViewUrl(
+export async function resolveEvidenceViewUrl(
   store: ObjectStore,
   tx: TenantClient,
-  attachmentId: string,
+  evidenceId: string,
 ): Promise<EvidenceViewUrl | null> {
-  const row = await tx.attachment.findUnique({
-    where: { id: attachmentId },
-    select: { r2Key: true, status: true, deletedAt: true },
+  const ev = await tx.evidence.findUnique({
+    where: { id: evidenceId },
+    select: { attachment: { select: { r2Key: true, status: true, deletedAt: true } } },
   });
-  // Only a live, uploaded object is viewable. Anything else is indistinguishable from "does not exist".
-  if (!row || row.status !== "uploaded" || row.deletedAt) return null;
-  const signed = await store.presignGet(row.r2Key); // default TTL <= 5 min (§10.5/§22)
+  const att = ev?.attachment;
+  // Only a live, uploaded object linked to this evidence is viewable; anything else reads as "absent".
+  if (!att || att.status !== "uploaded" || att.deletedAt) return null;
+  const signed = await store.presignGet(att.r2Key); // default TTL <= 5 min (§10.5/§22)
   return { url: signed.url, expiresIn: signed.expiresIn };
 }
