@@ -1,0 +1,106 @@
+name: Neon preview branch
+
+# Own the FULL lifecycle of per-PR Neon database branches so they can never accumulate again (the Neon
+# branch limit was exceeded once because Vercel's native integration auto-created a branch per preview and
+# never reaped them — see README "Database environments" for the dashboard runbook that disables that).
+#
+# One branch per PR, deterministically named `preview/pr-<number>`:
+#   - opened / reopened / synchronize -> create (idempotent) + run `prisma migrate deploy` against it
+#   - closed (merged or not)          -> delete
+#
+# Reusable: copy this file into any Neon + Prisma repo and set the two secrets below — nothing else is
+# repo-specific.
+#
+# Required repository secrets:
+#   NEON_API_KEY     Neon API key    (Neon Console -> Account settings -> API keys)
+#   NEON_PROJECT_ID  Neon project id (Neon Console -> Project -> Settings -> General)
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, closed]
+
+# Serialize per-PR so a fast close can't race an in-flight create (don't cancel: a cancelled create could
+# orphan a branch the teardown then can't find).
+concurrency:
+  group: neon-preview-${{ github.event.number }}
+  cancel-in-progress: false
+
+# Only the Neon API is touched; no write access to the repo is needed.
+permissions:
+  contents: read
+
+env:
+  NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+  NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+  BRANCH_NAME: preview/pr-${{ github.event.number }}
+
+jobs:
+  # Skip cleanly (no red check) until the Neon secrets are configured — `secrets` can't be read in a
+  # job-level `if`, so surface their presence as a job output the real jobs gate on. This makes the
+  # workflow safe to merge before the one-time secret setup in the README runbook is done.
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+        run: |
+          if [ -n "$NEON_API_KEY" ] && [ -n "$NEON_PROJECT_ID" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Neon secrets (NEON_API_KEY / NEON_PROJECT_ID) not set — skipping. See README." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  setup:
+    name: Create & migrate preview branch
+    needs: guard
+    if: ${{ needs.guard.outputs.enabled == 'true' && github.event.action != 'closed' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Idempotent: on `synchronize` the branch already exists and the action returns its connection info.
+      - name: Create Neon branch
+        id: create
+        uses: neondatabase/create-branch-action@v5
+        with:
+          project_id: ${{ env.NEON_PROJECT_ID }}
+          branch_name: ${{ env.BRANCH_NAME }}
+          api_key: ${{ env.NEON_API_KEY }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      # Migrations reference no DB role (grants live in the elevated superuser step, applied separately),
+      # so `migrate deploy` runs cleanly on a bare branch as its owner role — a real per-PR check that the
+      # migration chain applies on a production-like Neon branch.
+      - name: Apply migrations to the branch
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ steps.create.outputs.db_url }}
+
+      - name: Summary
+        run: echo "Neon branch **${BRANCH_NAME}** created and migrated." >> "$GITHUB_STEP_SUMMARY"
+
+  teardown:
+    name: Delete preview branch
+    needs: guard
+    if: ${{ needs.guard.outputs.enabled == 'true' && github.event.action == 'closed' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete Neon branch
+        uses: neondatabase/delete-branch-action@v3
+        with:
+          project_id: ${{ env.NEON_PROJECT_ID }}
+          branch: ${{ env.BRANCH_NAME }}
+          api_key: ${{ env.NEON_API_KEY }}
+
+      - name: Summary
+        run: echo "Neon branch **${BRANCH_NAME}** deleted." >> "$GITHUB_STEP_SUMMARY"
