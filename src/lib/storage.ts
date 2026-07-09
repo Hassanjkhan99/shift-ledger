@@ -30,7 +30,7 @@ export interface ObjectStore {
   headObject(key: string): Promise<{ size: number } | null>;
 }
 
-const DEFAULT_PUT_TTL = 300; // 5 min — long enough for a kitchen photo upload, short enough to be safe.
+const DEFAULT_PUT_TTL = 60; // §22: upload PUT URLs <= 60s — bounds the window a leaked/stale PUT is usable.
 const DEFAULT_GET_TTL = 300; // §10.5 / §22: view URLs are <= 5 min.
 
 /** Cloudflare R2 (S3-compatible) object store, signed with aws4fetch (zero-dep SigV4). */

@@ -205,4 +205,37 @@ describe("finalizeAttachment", () => {
     expect(second.checksumSha256).toBe(first.checksumSha256);
     expect(second.capturedAt).toBeNull(); // PDF has no capture time
   });
+
+  it("#116 repoints r2_key to a content-addressed key the client never presigned", async () => {
+    const store = new InMemoryObjectStore("shift-ledger-eu");
+    const id = await stagePending(store, orgAId, "application/pdf", "pdf", PDF_BYTES);
+    const before = await withTenant(orgAId, (tx) =>
+      tx.attachment.findUniqueOrThrow({ where: { id }, select: { r2Key: true } }),
+    );
+    const res = await withTenant(orgAId, (tx) =>
+      finalizeAttachment(store, tx, { organizationId: orgAId, attachmentId: id }),
+    );
+    const after = await withTenant(orgAId, (tx) =>
+      tx.attachment.findUniqueOrThrow({ where: { id }, select: { r2Key: true } }),
+    );
+    expect(after.r2Key).not.toBe(before.r2Key); // moved off the client-presigned upload key
+    expect(after.r2Key).toContain(res.checksumSha256); // content-addressed
+    // The finalized object lives at the new key.
+    expect(await store.getObject(after.r2Key)).not.toBeNull();
+  });
+
+  it("#116 fails closed when the uploaded object exceeds the per-type size limit", async () => {
+    const store = new InMemoryObjectStore("shift-ledger-eu");
+    const oversized = new Uint8Array(10 * 1024 * 1024 + 1); // > 10 MB image limit
+    const id = await stagePending(store, orgAId, "image/jpeg", "jpg", oversized);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        finalizeAttachment(store, tx, { organizationId: orgAId, attachmentId: id }),
+      ),
+    ).rejects.toThrow();
+    const row = await withTenant(orgAId, (tx) =>
+      tx.attachment.findUniqueOrThrow({ where: { id }, select: { status: true } }),
+    );
+    expect(row.status).toBe("pending"); // never finalized
+  });
 });

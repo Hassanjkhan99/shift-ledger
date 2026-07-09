@@ -9,6 +9,7 @@ import { createHash } from "node:crypto";
 import type { ObjectStore } from "./storage";
 import type { TenantClient } from "./db";
 import { detectContentType, sanitizeImage } from "./image-sanitize";
+import { UPLOAD_ALLOWLIST } from "./uploads";
 
 export interface FinalizeResult {
   attachmentId: string;
@@ -55,6 +56,20 @@ export async function finalizeAttachment(
     };
   }
 
+  const spec = UPLOAD_ALLOWLIST[row.contentType as keyof typeof UPLOAD_ALLOWLIST];
+  if (!spec) throw new Error(`finalize: unsupported content type ${row.contentType}`);
+
+  // Over-limit guard BEFORE reading the object into memory: an authed client can presign a small
+  // byteSize then PUT a huge object; HEAD it first and fail closed if it exceeds the per-type limit,
+  // so a giant upload can't OOM the finalize worker.
+  const head = await store.headObject(row.r2Key);
+  if (!head) throw new Error("finalize: object missing in store"); // fail closed
+  if (head.size > spec.maxBytes) {
+    throw new Error(
+      `finalize: object exceeds the ${spec.maxBytes}-byte limit for ${row.contentType}`,
+    );
+  }
+
   const bytes = await store.getObject(row.r2Key);
   if (!bytes) throw new Error("finalize: object missing in store"); // fail closed
 
@@ -66,14 +81,15 @@ export async function finalizeAttachment(
     );
   }
 
-  // Strip EXIF/GPS (photos) + recover capture time; re-put the sanitized object so R2 holds clean bytes.
   const { sanitized, capturedAt } = sanitizeImage(row.contentType, bytes);
-  if (sanitized !== bytes) {
-    await store.putObject(row.r2Key, sanitized, row.contentType);
-  }
-
   const checksumSha256 = createHash("sha256").update(sanitized).digest("hex");
   const byteSize = sanitized.byteLength;
+
+  // Immutability (F6): write the sanitized bytes to a NEW content-addressed key the client never got a
+  // presign for, and repoint r2_key to it. A still-valid presigned PUT to the original upload key can
+  // therefore no longer swap the finalized object. (The old upload object is orphaned; retention purges.)
+  const finalKey = `org/${args.organizationId}/evidence/${args.attachmentId}-${checksumSha256}.${spec.ext}`;
+  await store.putObject(finalKey, sanitized, row.contentType);
 
   // Atomic compare-and-set: only a still-pending row flips to uploaded. Raw SQL (not a Prisma .update)
   // because (a) this is a conditional pending->uploaded CAS for idempotency + concurrency, and (b)
@@ -86,6 +102,7 @@ export async function finalizeAttachment(
            "byte_size" = ${byteSize},
            "checksum_sha256" = ${checksumSha256},
            "captured_at" = ${capturedAt},
+           "r2_key" = ${finalKey},
            "updated_at" = now()
      WHERE "id" = ${args.attachmentId}::uuid
        AND "organization_id" = ${args.organizationId}::uuid
