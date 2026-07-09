@@ -5,6 +5,7 @@
 import Link from "next/link";
 import type { OrgRole } from "@/generated/prisma/enums";
 import { NotificationBadge } from "./NotificationBadge";
+import { SignOutButton } from "./SignOutButton";
 
 // Staff is the only role below the exceptions read scope; everyone else (incl. read-only Auditor) sees it.
 function canSeeExceptions(role: OrgRole): boolean {
@@ -36,6 +37,7 @@ export function OrgNav({ org, role }: { org: string; role: OrgRole }) {
             <NotificationBadge org={org} />
           </Link>
         )}
+        <SignOutButton className="mt-auto rounded-md px-3 py-2 text-left text-sm font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-60 dark:text-zinc-300 dark:hover:bg-zinc-900" />
       </nav>
 
       {/* Mobile bottom bar */}
@@ -56,6 +58,7 @@ export function OrgNav({ org, role }: { org: string; role: OrgRole }) {
             <NotificationBadge org={org} />
           </Link>
         )}
+        <SignOutButton className="px-4 py-1 text-xs font-medium text-zinc-700 disabled:opacity-60 dark:text-zinc-300" />
       </nav>
     </>
   );

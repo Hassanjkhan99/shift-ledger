@@ -35,10 +35,24 @@ export async function resolveMemberForOrg(
   headers: Headers,
   orgId: string,
 ): Promise<MemberContext | null> {
-  if (!UUID_RE.test(orgId)) return null;
   const session = await getAuth().api.getSession({ headers });
   const email = session?.user?.email;
   if (!email) return null;
+  return resolveMemberForEmail(email, orgId);
+}
+
+/**
+ * Resolve the member context for an already-authenticated `email` and an EXPLICIT organization id, or
+ * null if the org id is malformed or the user is not an active member of it. This is the membership half
+ * of {@link resolveMemberForOrg}, split out so a caller that has already fetched the session (the
+ * `(app)/[org]` layout, #131) can distinguish "no session" from "session but not a member" — the former
+ * redirects to sign-in, the latter is a 404 — without a second session lookup.
+ */
+export async function resolveMemberForEmail(
+  email: string,
+  orgId: string,
+): Promise<MemberContext | null> {
+  if (!UUID_RE.test(orgId)) return null;
 
   return withTenant(orgId, async (tx) => {
     // `users` is global (no RLS); memberships is RLS-scoped to orgId, so this only finds a membership
