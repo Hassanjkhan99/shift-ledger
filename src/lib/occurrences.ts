@@ -20,234 +20,31 @@
 // cases explicitly rather than trusting a library default (see computeDueAt).
 
 import { DateTime } from "luxon";
-import { z } from "zod";
-import { CheckType, RecurrenceFreq } from "../generated/prisma/enums";
+import { CheckType } from "../generated/prisma/enums";
 import type { OccurrenceStatus } from "../generated/prisma/enums";
 import { Prisma } from "../generated/prisma/client";
 import type { TenantClient } from "./db";
 import { transition, logActivity } from "./transition";
+import {
+  RecurrenceSchema,
+  parseRecurrence,
+  computeDueAt,
+  timeOfDayHHmm,
+  recurrenceFiresOn,
+  dateOnlyToLocal,
+  type Recurrence,
+} from "./recurrence";
 
-// ---- Typed recurrence (§9.1) ----------------------------------------------------
-// A deliberately small, Zod-validatable shape — NOT an iCal RRULE. weekday: 1..7 (Mon..Sun,
-// luxon convention). byMonthDay: 1..31. timeOfDay: local wall-clock "HH:mm".
-export const RecurrenceSchema = z
-  .object({
-    freq: z.enum([RecurrenceFreq.daily, RecurrenceFreq.weekly, RecurrenceFreq.monthly]),
-    interval: z.number().int().positive(),
-    // When present, a day-filter must list at least one day. An empty array is NOT "matches
-    // nothing" — it is a malformed schedule that would silently generate zero occurrences, so
-    // reject it loudly (.min(1)) rather than letting recurrenceFiresOn treat [] as a filter.
-    byWeekday: z.array(z.number().int().min(1).max(7)).min(1).optional(),
-    byMonthDay: z.array(z.number().int().min(1).max(31)).min(1).optional(),
-    timeOfDay: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "timeOfDay must be HH:mm"),
-  })
-  .strict()
-  // Frequency-specific filter guard: a byWeekday filter only makes sense for weekly and a
-  // byMonthDay filter only for monthly. A mismatched filter (e.g. daily + byWeekday) would be
-  // silently IGNORED by recurrenceFiresOn (daily has no filter branch), materializing more
-  // occurrences than the author intended. Reject the mismatch loudly instead.
-  .superRefine((rec, ctx) => {
-    if (rec.byWeekday !== undefined && rec.freq !== RecurrenceFreq.weekly) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["byWeekday"],
-        message: "byWeekday is only valid when freq === 'weekly'",
-      });
-    }
-    if (rec.byMonthDay !== undefined && rec.freq !== RecurrenceFreq.monthly) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ["byMonthDay"],
-        message: "byMonthDay is only valid when freq === 'monthly'",
-      });
-    }
-  });
-
-export type Recurrence = z.infer<typeof RecurrenceSchema>;
-
-/** Parse+validate a scheduled_task.recurrence_json blob through the Zod schema. */
-export function parseRecurrence(json: unknown): Recurrence {
-  return RecurrenceSchema.parse(json);
-}
-
-/**
- * Interpret `localDate` (a calendar date) + `timeOfDay` ("HH:mm") as a wall-clock in the IANA
- * `timezone` and return the corresponding UTC instant as a JS Date. DST edge cases (§9.6):
- *
- *  - Spring-forward gap (e.g. 02:30 on the DE spring transition does not exist): roll FORWARD to
- *    the first valid instant — the moment the clock jumps to (03:00 local). luxon's own behavior
- *    is to shift the wall time forward by the gap length (02:30 -> 03:30), which is NOT what we
- *    want, so we detect the gap (the built hour/minute differs from what was requested) and force
- *    the result to the post-gap hour boundary.
- *  - Fall-back overlap (e.g. 02:30 occurs twice): choose the EARLIER (first) UTC instant. luxon
- *    resolves an ambiguous local time to the earlier instant by default; we detect the ambiguity
- *    and take the minimum of the two candidate instants, so the outcome is forced by us rather than
- *    trusted to a library default.
- */
-export function computeDueAt(localDate: Date, timeOfDay: string, timezone: string): Date {
-  const [hourStr, minuteStr] = timeOfDay.split(":");
-  const hour = Number(hourStr);
-  const minute = Number(minuteStr);
-
-  // Use the local calendar Y/M/D of the provided date (occurrence_local_date is a pure DATE).
-  const dt = DateTime.fromObject(
-    {
-      year: localDate.getUTCFullYear(),
-      month: localDate.getUTCMonth() + 1,
-      day: localDate.getUTCDate(),
-      hour,
-      minute,
-    },
-    { zone: timezone },
-  );
-
-  if (!dt.isValid) {
-    throw new Error(`computeDueAt: invalid datetime for ${timezone} (${dt.invalidReason})`);
-  }
-
-  // Spring-forward gap: luxon pushed the wall time out of the requested slot. Force to the first
-  // valid instant = the start of the hour the clock jumped to.
-  if (dt.hour !== hour || dt.minute !== minute) {
-    const jumped = DateTime.fromObject(
-      {
-        year: localDate.getUTCFullYear(),
-        month: localDate.getUTCMonth() + 1,
-        day: localDate.getUTCDate(),
-        hour: hour + 1, // the clock skips this local hour; the next hour is the first valid one
-        minute: 0,
-      },
-      { zone: timezone },
-    );
-    return jumped.toJSDate();
-  }
-
-  // Fall-back overlap: the same wall time exists twice. Take the EARLIER (first) UTC instant.
-  // We must NOT rely on which of the two the initial parse picked (dt.isAmbiguous is unreliable
-  // once the generator self-heals earlier on the same local day). Instead, enumerate BOTH candidate
-  // UTC offsets the zone applies to this wall-clock and take the MINIMUM UTC instant, so the earlier
-  // one is chosen regardless of which offset the initial DateTime landed on.
-  const candidates = possibleUtcMillis(
-    localDate.getUTCFullYear(),
-    localDate.getUTCMonth() + 1,
-    localDate.getUTCDate(),
-    hour,
-    minute,
-    timezone,
-  );
-  return new Date(Math.min(...candidates));
-}
-
-/**
- * Enumerate every distinct UTC instant that the given local wall-clock maps to in `timezone`. For a
- * normal (non-DST) wall time this is a single instant; for a fall-back overlap the same wall time
- * maps to TWO instants (before and after the clock is set back). We probe the two adjacent standard
- * offsets by building the DateTime once and once shifted by the possible DST delta, keeping only the
- * candidates that round-trip back to the requested wall-clock. Callers pick min/max as needed.
- */
-function possibleUtcMillis(
-  year: number,
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  timezone: string,
-): number[] {
-  const base = DateTime.fromObject({ year, month, day, hour, minute }, { zone: timezone });
-  // Candidate offsets (in minutes) around the base local time: the offset the base resolved to,
-  // and the offsets one hour before / one hour after (which straddle a DST fall-back boundary).
-  // NOTE: luxon .offset below is a DST UTC shift, not SQL OFFSET pagination (F5 guard).
-  const probeOffsets = new Set<number>([
-    base.offset, // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
-    base.minus({ hours: 1 }).offset, // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
-    base.plus({ hours: 1 }).offset, // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
-  ]);
-
-  const millis = new Set<number>();
-  for (const offsetMinutes of probeOffsets) {
-    // A wall-clock at `offsetMinutes` corresponds to this UTC instant…
-    const utc = DateTime.fromObject({ year, month, day, hour, minute }, { zone: "utc" }).minus({
-      minutes: offsetMinutes,
-    });
-    // …but only accept it if, viewed back in `timezone`, it actually reads as the requested wall
-    // time with that same offset (rejects the phantom instant from the offset that doesn't apply). // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
-    const roundTrip = utc.setZone(timezone);
-    if (
-      roundTrip.hour === hour &&
-      roundTrip.minute === minute &&
-      roundTrip.offset === offsetMinutes // keyset-guard-allow: luxon .offset is a DST UTC shift, not SQL OFFSET (F5)
-    ) {
-      millis.add(utc.toMillis());
-    }
-  }
-  // Fallback: if nothing round-tripped (shouldn't happen for a valid non-gap time), use base.
-  return millis.size > 0 ? [...millis] : [base.toMillis()];
-}
-
-/**
- * Read the wall-clock "HH:mm" from the dedicated `time_of_day` column. Prisma maps a `@db.Time`
- * to a JS Date whose UTC time-of-day carries HH:mm:ss (the date part is the 1970 epoch). This
- * column is separately editable, so generation honors a time-only edit here even if it diverges
- * from recurrence_json.timeOfDay (which still drives the firing-day logic).
- */
-export function timeOfDayHHmm(timeOfDay: Date): string {
-  const hh = String(timeOfDay.getUTCHours()).padStart(2, "0");
-  const mm = String(timeOfDay.getUTCMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-/**
- * Interpret a date-only `@db.Date` value (which Prisma returns as UTC midnight) as the start of
- * that same calendar day in `timezone`. Uses the UTC Y/M/D fields so the calendar day is preserved
- * regardless of the zone's distance from UTC — unlike fromJSDate, which would shift it west of UTC.
- */
-function dateOnlyToLocal(dateOnly: Date, timezone: string): DateTime {
-  return DateTime.fromObject(
-    {
-      year: dateOnly.getUTCFullYear(),
-      month: dateOnly.getUTCMonth() + 1,
-      day: dateOnly.getUTCDate(),
-    },
-    { zone: timezone },
-  ).startOf("day");
-}
+// The typed recurrence + DST-correct due-time logic lives in ./recurrence (pure, client-importable so
+// the #136 scheduling preview shares one implementation). Re-exported here so existing importers
+// (tests, actions) keep importing from ./occurrences.
+export { RecurrenceSchema, parseRecurrence, computeDueAt, timeOfDayHHmm };
+export type { Recurrence };
 
 /** The three local dates in the rolling window [today_local, today_local + 2] (§9.2). */
 function windowLocalDates(now: Date, timezone: string): DateTime[] {
   const today = DateTime.fromJSDate(now, { zone: timezone }).startOf("day");
   return [today, today.plus({ days: 1 }), today.plus({ days: 2 })];
-}
-
-/** Does the recurrence fire on this local calendar date? Respects freq/interval/byWeekday/byMonthDay. */
-function recurrenceFiresOn(rec: Recurrence, startsOn: DateTime, candidate: DateTime): boolean {
-  if (candidate < startsOn.startOf("day")) return false;
-
-  switch (rec.freq) {
-    case RecurrenceFreq.daily: {
-      const days = Math.round(candidate.diff(startsOn.startOf("day"), "days").days);
-      return days % rec.interval === 0;
-    }
-    case RecurrenceFreq.weekly: {
-      // Interval counts whole weeks from the week of starts_on.
-      const weeks = Math.floor(
-        candidate.startOf("day").diff(startsOn.startOf("week"), "weeks").weeks,
-      );
-      if (weeks % rec.interval !== 0) return false;
-      const weekdays = rec.byWeekday ?? [startsOn.weekday];
-      return weekdays.includes(candidate.weekday);
-    }
-    case RecurrenceFreq.monthly: {
-      const months = (candidate.year - startsOn.year) * 12 + (candidate.month - startsOn.month);
-      if (months % rec.interval !== 0) return false;
-      const monthDays = rec.byMonthDay ?? [startsOn.day];
-      // Clamp each requested month-day to the last valid day of the candidate month, so a
-      // schedule on day 31 (explicit byMonthDay or a starts_on on the 31st) still fires in short
-      // months — Feb 28/29, Apr 30, etc. — instead of silently never firing.
-      const daysInMonth = candidate.daysInMonth ?? 31;
-      return monthDays.some((d) => Math.min(d, daysInMonth) === candidate.day);
-    }
-    default:
-      return false;
-  }
 }
 
 export interface GenerateArgs {

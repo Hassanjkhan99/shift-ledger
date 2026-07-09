@@ -203,6 +203,11 @@ export function canManageTemplates(role: OrgRole): boolean {
   return ORG_MANAGER_ROLES.has(role);
 }
 
+/** True if `role` may create/edit/deactivate scheduled tasks (D7, #136). Same author set as templates. */
+export function canManageSchedules(role: OrgRole): boolean {
+  return CONFIG_AUTHOR_ROLES.has(role);
+}
+
 // ---- Members & invitations authorization (#134, D7) -----------------------------
 // Owner/OrgAdmin manage the whole roster; a PropertyManager may manage members within their scope.
 
