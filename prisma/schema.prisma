@@ -534,6 +534,9 @@ model Attachment {
   checksumSha256 String?   @map("checksum_sha256")
   /// 'pending' -> 'uploaded' (finalize). DB CHECK constrains the domain (Prisma can't express it).
   status         String    @default("pending")
+  /// Photo capture time preserved from EXIF at finalize (#106) after EXIF/GPS is stripped. Null when
+  /// not a photo or no DateTimeOriginal tag was present.
+  capturedAt     DateTime? @map("captured_at") @db.Timestamptz(6)
   uploadedBy     String?   @map("uploaded_by") @db.Uuid
   createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
   updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(6)
