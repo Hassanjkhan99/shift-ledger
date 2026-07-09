@@ -76,7 +76,9 @@ describe("enqueueExport + processExportJob", () => {
     expect(att.status).toBe("uploaded"); // finalized (F6 checksum recorded)
     expect(att.contentType).toBe("application/pdf");
     expect(att.checksumSha256).toMatch(/^[0-9a-f]{64}$/);
-    expect(att.r2Key.startsWith(`org/${orgAId}/exports/`)).toBe(true);
+    // Finalize repoints to a content-addressed key under the org prefix (#116).
+    expect(att.r2Key.startsWith(`org/${orgAId}/`)).toBe(true);
+    expect(att.r2Key).toContain(att.checksumSha256!);
 
     // The stored object really is a PDF.
     const bytes = await store.getObject(att.r2Key);
