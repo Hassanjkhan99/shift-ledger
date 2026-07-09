@@ -70,6 +70,11 @@ export function buildEvidenceKey(orgId: string, objectId: string, ext: string): 
   return `org/${orgId}/evidence/${objectId}.${ext}`;
 }
 
+/** Org-prefixed key for a generated export pack (§22). Same org/{orgId}/ tenant prefix as evidence. */
+export function buildExportKey(orgId: string, exportJobId: string): string {
+  return `org/${orgId}/exports/${exportJobId}.pdf`;
+}
+
 export interface CreateUploadResult {
   uploadUrl: string;
   attachmentId: string;
