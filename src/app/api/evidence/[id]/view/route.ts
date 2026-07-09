@@ -8,7 +8,7 @@ import { withTenant } from "../../../../../lib/db";
 import { logger } from "../../../../../lib/logger";
 import { getObjectStore, type ObjectStore } from "../../../../../lib/storage";
 import { resolveMemberContext, type MemberContext } from "../../../../../lib/http-auth";
-import { resolveAttachmentViewUrl } from "../../../../../lib/evidence-view";
+import { resolveEvidenceViewUrl } from "../../../../../lib/evidence-view";
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -29,7 +29,7 @@ export async function handleEvidenceView(
   if (!UUID_RE.test(id)) return new Response(null, { status: 404 });
 
   const view = await withTenant(ctx.organizationId, (tx) =>
-    resolveAttachmentViewUrl(deps.store, tx, id),
+    resolveEvidenceViewUrl(deps.store, tx, id),
   );
   if (!view) return new Response(null, { status: 404 }); // cross-tenant / not-found / pending / deleted
 
