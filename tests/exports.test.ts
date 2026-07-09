@@ -138,6 +138,7 @@ describe("handleExportDownload", () => {
     async () => ({
       organizationId: org,
       userId,
+      role: "Auditor" as const, // downloads are reads; Auditor may view
     });
 
   it("302s to a signed URL for a completed job in the caller's org", async () => {

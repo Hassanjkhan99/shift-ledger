@@ -155,7 +155,11 @@ describe("handlePresignUpload — route behaviour", () => {
   });
 
   it("422s on an invalid body (bad MIME)", async () => {
-    const ctx: MemberContext = { organizationId: orgAId, userId: await orgMember(orgAId) };
+    const ctx: MemberContext = {
+      organizationId: orgAId,
+      userId: await orgMember(orgAId),
+      role: "Staff",
+    };
     const res = await handlePresignUpload(
       jsonReq({ contentType: "text/html", byteSize: 10, kind: "file" }),
       {
@@ -166,8 +170,28 @@ describe("handlePresignUpload — route behaviour", () => {
     expect(res.status).toBe(422);
   });
 
+  it("403s for a read-only Auditor (write-gate)", async () => {
+    const ctx: MemberContext = {
+      organizationId: orgAId,
+      userId: await orgMember(orgAId),
+      role: "Auditor",
+    };
+    const res = await handlePresignUpload(
+      jsonReq({ contentType: "image/jpeg", byteSize: 10, kind: "photo" }),
+      {
+        resolveContext: async () => ctx,
+        store: new InMemoryObjectStore(),
+      },
+    );
+    expect(res.status).toBe(403);
+  });
+
   it("201s and returns a presign for a valid authenticated request", async () => {
-    const ctx: MemberContext = { organizationId: orgAId, userId: await orgMember(orgAId) };
+    const ctx: MemberContext = {
+      organizationId: orgAId,
+      userId: await orgMember(orgAId),
+      role: "Staff",
+    };
     const res = await handlePresignUpload(
       jsonReq({ contentType: "application/pdf", byteSize: 5000, kind: "file" }),
       { resolveContext: async () => ctx, store: new InMemoryObjectStore("shift-ledger-eu") },
