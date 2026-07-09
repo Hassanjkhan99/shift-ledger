@@ -102,6 +102,12 @@ export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: 
             Settings
           </Link>
         )}
+        <Link
+          href={`/${org}/exports`}
+          className="mt-1 rounded-md px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+        >
+          Exports
+        </Link>
         <SignOutButton className="mt-auto rounded-md px-3 py-2 text-left text-sm font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-60 dark:text-zinc-300 dark:hover:bg-zinc-900" />
       </nav>
 
