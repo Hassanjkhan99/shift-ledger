@@ -89,6 +89,17 @@ async function makeAttachment(orgId: string, uploadedBy?: string | null): Promis
   });
 }
 
+/** Create an attachment already flipped to `uploaded` (so binary evidence may reference it, #115). */
+async function makeUploadedAttachment(orgId: string): Promise<string> {
+  const id = await makeAttachment(orgId);
+  await withTenant(
+    orgId,
+    (tx) =>
+      tx.$executeRaw`UPDATE attachments SET status='uploaded', byte_size=1, checksum_sha256=${"a".repeat(64)} WHERE id=${id}::uuid`,
+  );
+  return id;
+}
+
 describe("D4 requiresAttachment() — truth table", () => {
   it("photo and file always require an attachment", () => {
     expect(requiresAttachment("photo")).toBe(true);
@@ -189,7 +200,7 @@ describe("evidence CHECKs — D4 attachment rule + value shape", () => {
 
   it("photo WITH an attachment succeeds", async () => {
     const { completionId } = await makeCompletion(orgAId);
-    const attachmentId = await makeAttachment(orgAId);
+    const attachmentId = await makeUploadedAttachment(orgAId);
     const ev = await withTenant(orgAId, (tx) =>
       tx.evidence.create({
         data: {
@@ -206,7 +217,7 @@ describe("evidence CHECKs — D4 attachment rule + value shape", () => {
 
   it("non-binary evidence (note) carrying an attachment is rejected", async () => {
     const { completionId } = await makeCompletion(orgAId);
-    const attachmentId = await makeAttachment(orgAId);
+    const attachmentId = await makeUploadedAttachment(orgAId);
     await expect(
       withTenant(orgAId, (tx) =>
         tx.evidence.create({
@@ -249,7 +260,7 @@ describe("evidence CHECKs — D4 attachment rule + value shape", () => {
 
   it("a drawn signature (attachment, no value_text) is accepted", async () => {
     const { completionId } = await makeCompletion(orgAId);
-    const attachmentId = await makeAttachment(orgAId);
+    const attachmentId = await makeUploadedAttachment(orgAId);
     const ev = await withTenant(orgAId, (tx) =>
       tx.evidence.create({
         data: {
@@ -379,5 +390,107 @@ describe("attachments — finalize write-once guard (F6)", () => {
       }),
     );
     expect(tombstoned.deletedAt).not.toBeNull();
+  });
+});
+
+describe("#115 attachment/evidence integrity hardening", () => {
+  it("freezes content_type after upload", async () => {
+    const id = await makeUploadedAttachment(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.update({ where: { id }, data: { contentType: "application/pdf" } }),
+      ),
+    ).rejects.toThrow(/immutable/i);
+  });
+
+  it("rejects a pending attachment that already carries integrity metadata", async () => {
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.create({
+          data: {
+            organizationId: orgAId,
+            r2Bucket: "shift-ledger-eu",
+            r2Key: `org/${orgAId}/evidence/${randomUUID()}`,
+            contentType: "image/jpeg",
+            checksumSha256: "a".repeat(64), // status defaults to pending -> forbidden
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects a malformed checksum and a non-positive byte_size", async () => {
+    const id = await makeAttachment(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.update({
+          where: { id },
+          data: { status: "uploaded", byteSize: BigInt(10), checksumSha256: "NOTHEX" },
+        }),
+      ),
+    ).rejects.toThrow();
+    const id2 = await makeAttachment(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.attachment.update({
+          where: { id: id2 },
+          data: { status: "uploaded", byteSize: BigInt(0), checksumSha256: "a".repeat(64) },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("forbids stray value columns on typed evidence (temperature with value_text)", async () => {
+    const { completionId } = await makeCompletion(orgAId);
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.evidence.create({
+          data: {
+            organizationId: orgAId,
+            taskCompletionId: completionId,
+            type: "temperature",
+            valueNumeric: "3.4",
+            valueText: "stray", // exclusive CHECK rejects
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects binary evidence referencing a pending (not-yet-uploaded) attachment", async () => {
+    const { completionId } = await makeCompletion(orgAId);
+    const pending = await makeAttachment(orgAId); // still pending
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.evidence.create({
+          data: {
+            organizationId: orgAId,
+            taskCompletionId: completionId,
+            type: "photo",
+            attachmentId: pending,
+          },
+        }),
+      ),
+    ).rejects.toThrow();
+  });
+
+  it("rejects binary evidence referencing a soft-deleted attachment", async () => {
+    const { completionId } = await makeCompletion(orgAId);
+    const id = await makeUploadedAttachment(orgAId);
+    await withTenant(orgAId, (tx) =>
+      tx.attachment.update({ where: { id }, data: { deletedAt: new Date() } }),
+    );
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.evidence.create({
+          data: {
+            organizationId: orgAId,
+            taskCompletionId: completionId,
+            type: "file",
+            attachmentId: id,
+          },
+        }),
+      ),
+    ).rejects.toThrow();
   });
 });
