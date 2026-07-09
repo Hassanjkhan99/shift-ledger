@@ -160,6 +160,7 @@ describe("handleEvidenceView — route behaviour", () => {
       organizationId: org,
       userId: "00000000-0000-0000-0000-000000000000",
       role: "Auditor",
+      propertyScope: [],
     });
 
   it("302s to the signed URL for an in-tenant evidence", async () => {

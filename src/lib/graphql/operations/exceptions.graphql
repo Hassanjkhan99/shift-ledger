@@ -1,0 +1,19 @@
+query Exceptions($status: ExceptionStatus, $cursor: String, $limit: Int) {
+  exceptions(status: $status, cursor: $cursor, limit: $limit) {
+    items {
+      id
+      status
+      severity
+      title
+      detail
+      outletId
+      propertyId
+      openedAt
+    }
+    nextCursor
+  }
+}
+
+query OpenExceptionsCount {
+  openExceptionsCount
+}
