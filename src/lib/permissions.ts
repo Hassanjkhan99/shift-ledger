@@ -146,3 +146,20 @@ export function roleMayTrigger<M extends Machine>(
   const allowed = machineMatrix[edge as string];
   return allowed !== undefined && allowed.includes(role);
 }
+
+// ---- Evidence write authorization (#114) ----------------------------------------
+// Auditor + ExternalInspector are READ-ONLY (D7): they may view evidence/exports but not create it.
+// Every other org role may write evidence. Enforced by POST /api/uploads + /api/uploads/finalize.
+const EVIDENCE_WRITE_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([
+  OrgRole.Owner,
+  OrgRole.OrgAdmin,
+  OrgRole.PropertyManager,
+  OrgRole.KitchenManager,
+  OrgRole.ShiftLeader,
+  OrgRole.Staff,
+]);
+
+/** True if `role` may create/write evidence (upload + finalize). Read-only roles get 403. */
+export function canWriteEvidence(role: OrgRole): boolean {
+  return EVIDENCE_WRITE_ROLES.has(role);
+}

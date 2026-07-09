@@ -28,6 +28,7 @@
     "@react-pdf/renderer": "^4.5.1",
     "@sentry/nextjs": "^10.63.0",
     "aws4fetch": "^1.0.20",
+    "better-auth": "^1.6.23",
     "luxon": "^3.7.2",
     "next": "16.2.9",
     "pg": "^8.22.0",

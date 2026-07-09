@@ -156,7 +156,11 @@ describe("handleEvidenceView — route behaviour", () => {
   const req = new Request("http://localhost/api/evidence/x/view");
   const ctxFor =
     (org: string): (() => Promise<MemberContext>) =>
-    async () => ({ organizationId: org, userId: "00000000-0000-0000-0000-000000000000" });
+    async () => ({
+      organizationId: org,
+      userId: "00000000-0000-0000-0000-000000000000",
+      role: "Auditor",
+    });
 
   it("302s to the signed URL for an in-tenant evidence", async () => {
     const store = new InMemoryObjectStore("shift-ledger-eu");

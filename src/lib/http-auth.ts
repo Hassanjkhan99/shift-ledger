@@ -1,23 +1,48 @@
-// HTTP auth seam for the thin REST surface (#105 uploads, #107 view, #14 export download).
+// HTTP auth seam for the thin REST surface (#105 uploads, #106 finalize, #107 view, #14 export download).
 //
-// Reads (RSC) and writes (Server Actions) get their tenant context from the session elsewhere; the few
-// HTTP routes need the same. This is the SINGLE place that resolves a request -> { organizationId,
-// userId } and it FAILS CLOSED: with no valid session it returns null and the caller must 401.
+// As of #114 this is backed by Better Auth: resolveMemberContext() reads the authenticated session
+// (cookie or `Authorization: Bearer`), then maps the user's email to an ACTIVE membership to produce the
+// tenant/authorization context { organizationId, userId, role }. It FAILS CLOSED: no session, no
+// selected org, or no active membership -> null, and the caller 401s.
 //
-// NOTE (codebase reality): a session provider (Better Auth per the design) is not wired into this tree
-// yet, so resolveMemberContext currently has no session to read and returns null. When the session
-// layer lands, its lookup (session -> active_organization_id + user id + active-membership check)
-// plugs in HERE, and every HTTP route inherits authenticated, tenant-scoped access with no call-site
-// changes. Route handlers are written and tested against this seam via dependency injection.
+// Active-organization selection: the caller names the org via the `x-organization-id` header. This only
+// SELECTS among orgs; it grants nothing on its own — the membership lookup runs under withTenant(orgId)
+// RLS, so a caller can only obtain context for an org they are actually an active member of. (Persisting
+// the active org on the session is a UX refinement; the header is the mechanism.)
+import { getAuth } from "./auth";
+import { withTenant } from "./db";
+import type { OrgRole } from "../generated/prisma/enums";
+
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 export interface MemberContext {
   organizationId: string;
   userId: string;
+  role: OrgRole;
 }
 
 /**
- * Resolve the authenticated member context for an HTTP request, or null if there is no valid session /
- * active organization. Fail-closed by construction. Wire the real session lookup in here.
+ * Resolve the authenticated member context for an HTTP request, or null if there is no valid session,
+ * no selected organization, or the user is not an active member of it. Fail-closed by construction.
  */
-export async function resolveMemberContext(): Promise<MemberContext | null> {
-  return null;
+export async function resolveMemberContext(req: Request): Promise<MemberContext | null> {
+  const session = await getAuth().api.getSession({ headers: req.headers });
+  const email = session?.user?.email;
+  if (!email) return null;
+
+  const orgId = req.headers.get("x-organization-id");
+  if (!orgId || !UUID_RE.test(orgId)) return null;
+
+  return withTenant(orgId, async (tx) => {
+    // `users` is global (no RLS); memberships is RLS-scoped to orgId, so this only finds a membership
+    // when the authenticated user genuinely belongs to the named org.
+    const user = await tx.user.findUnique({ where: { email }, select: { id: true } });
+    if (!user) return null;
+    const membership = await tx.membership.findFirst({
+      where: { userId: user.id, status: "active", deletedAt: null },
+      select: { role: true },
+    });
+    if (!membership) return null;
+    return { organizationId: orgId, userId: user.id, role: membership.role };
+  });
 }

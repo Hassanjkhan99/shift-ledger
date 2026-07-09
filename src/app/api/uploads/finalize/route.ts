@@ -7,6 +7,7 @@ import { logger } from "../../../../lib/logger";
 import { getObjectStore, type ObjectStore } from "../../../../lib/storage";
 import { resolveMemberContext, type MemberContext } from "../../../../lib/http-auth";
 import { finalizeAttachment } from "../../../../lib/finalize";
+import { canWriteEvidence } from "../../../../lib/permissions";
 
 const finalizeSchema = z.object({ attachmentId: z.string().uuid() });
 
@@ -18,6 +19,7 @@ export interface FinalizeDeps {
 export async function handleFinalize(req: Request, deps: FinalizeDeps): Promise<Response> {
   const ctx = await deps.resolveContext(req);
   if (!ctx) return Response.json({ error: "unauthorized" }, { status: 401 });
+  if (!canWriteEvidence(ctx.role)) return Response.json({ error: "forbidden" }, { status: 403 });
 
   let body: unknown;
   try {

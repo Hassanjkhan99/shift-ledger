@@ -9,6 +9,7 @@ import { logger } from "../../../lib/logger";
 import { getObjectStore, type ObjectStore } from "../../../lib/storage";
 import { resolveMemberContext, type MemberContext } from "../../../lib/http-auth";
 import { createUpload, presignUploadSchema } from "../../../lib/uploads";
+import { canWriteEvidence } from "../../../lib/permissions";
 
 export interface UploadDeps {
   resolveContext: (req: Request) => Promise<MemberContext | null>;
@@ -19,6 +20,8 @@ export interface UploadDeps {
 export async function handlePresignUpload(req: Request, deps: UploadDeps): Promise<Response> {
   const ctx = await deps.resolveContext(req);
   if (!ctx) return Response.json({ error: "unauthorized" }, { status: 401 });
+  // Auditor / ExternalInspector are read-only (D7) — no minting upload URLs (#114).
+  if (!canWriteEvidence(ctx.role)) return Response.json({ error: "forbidden" }, { status: 403 });
 
   let body: unknown;
   try {
