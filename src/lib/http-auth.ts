@@ -19,6 +19,9 @@ export interface MemberContext {
   organizationId: string;
   userId: string;
   role: OrgRole;
+  // Property IDs this membership is limited to (empty = whole org). Used by read-scope filtering in the
+  // GraphQL layer (#15). Additive: existing REST callers destructure { organizationId, userId, role }.
+  propertyScope: string[];
 }
 
 /**
@@ -40,9 +43,14 @@ export async function resolveMemberContext(req: Request): Promise<MemberContext 
     if (!user) return null;
     const membership = await tx.membership.findFirst({
       where: { userId: user.id, status: "active", deletedAt: null },
-      select: { role: true },
+      select: { role: true, propertyScope: true },
     });
     if (!membership) return null;
-    return { organizationId: orgId, userId: user.id, role: membership.role };
+    return {
+      organizationId: orgId,
+      userId: user.id,
+      role: membership.role,
+      propertyScope: membership.propertyScope,
+    };
   });
 }

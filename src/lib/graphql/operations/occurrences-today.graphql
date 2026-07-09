@@ -1,0 +1,64 @@
+query OccurrencesToday($outletId: ID, $status: OccurrenceStatus, $date: String) {
+  occurrencesToday(outletId: $outletId, status: $status, date: $date) {
+    outlet {
+      id
+      name
+      propertyId
+    }
+    occurrences {
+      id
+      outletId
+      status
+      checkType
+      dueAt
+      occurrenceLocalDate
+      timezone
+      assigneeRole
+      assigneeUserId
+      configSnapshot
+      template {
+        id
+        title
+        checkType
+        requiredEvidence
+      }
+      currentCompletion {
+        id
+        result
+        isCurrent
+        version
+        recordedAt
+        evidenceCount
+      }
+    }
+  }
+}
+
+query Occurrence($id: ID!) {
+  occurrence(id: $id) {
+    id
+    outletId
+    status
+    checkType
+    dueAt
+    occurrenceLocalDate
+    timezone
+    assigneeRole
+    assigneeUserId
+    configSnapshot
+    template {
+      id
+      title
+      checkType
+      requiredEvidence
+    }
+    currentCompletion {
+      id
+      result
+      isCurrent
+      version
+      recordedAt
+      evidenceCount
+    }
+  }
+}

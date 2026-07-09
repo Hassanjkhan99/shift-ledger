@@ -1,0 +1,106 @@
+enum CheckType {
+  allergen
+  cleaning
+  closing
+  generic
+  opening
+  temperature
+}
+
+type Exception {
+  detail: String
+  id: ID!
+  openedAt: String!
+  outletId: ID!
+  propertyId: ID!
+  severity: String!
+  status: ExceptionStatus!
+  title: String!
+}
+
+type ExceptionPage {
+  items: [Exception!]!
+  nextCursor: String
+}
+
+enum ExceptionStatus {
+  acknowledged
+  in_progress
+  open
+  reopened
+  resolved
+  verified
+}
+
+scalar JSON
+
+enum OccurrenceStatus {
+  cancelled
+  completed
+  completed_late
+  due
+  failed
+  overdue
+  pending
+  skipped
+}
+
+enum OrgRole {
+  Auditor
+  ExternalInspector
+  KitchenManager
+  OrgAdmin
+  Owner
+  PropertyManager
+  ShiftLeader
+  Staff
+}
+
+type Outlet {
+  id: ID!
+  name: String!
+  propertyId: ID!
+}
+
+type OutletOccurrences {
+  occurrences: [TaskOccurrence!]!
+  outlet: Outlet!
+}
+
+type Query {
+  exceptions(cursor: String, limit: Int, status: ExceptionStatus): ExceptionPage!
+  occurrence(id: ID!): TaskOccurrence
+  occurrencesToday(date: String, outletId: ID, status: OccurrenceStatus): [OutletOccurrences!]!
+  openExceptionsCount: Int!
+}
+
+type TaskCompletion {
+  evidenceCount: Int!
+  id: ID!
+  isCurrent: Boolean!
+  recordedAt: String!
+  result: String!
+  version: Int!
+}
+
+type TaskOccurrence {
+  assigneeRole: OrgRole
+  assigneeUserId: ID
+  checkType: CheckType!
+  configSnapshot: JSON
+  currentCompletion: TaskCompletion
+  dueAt: String!
+  id: ID!
+  occurrenceLocalDate: String!
+  outletId: ID!
+  status: OccurrenceStatus!
+  template: TaskTemplate!
+  timezone: String!
+}
+
+type TaskTemplate {
+  checkType: CheckType!
+  id: ID!
+  requiredEvidence: [String!]!
+  title: String!
+}

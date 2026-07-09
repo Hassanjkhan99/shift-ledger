@@ -159,6 +159,7 @@ describe("handlePresignUpload — route behaviour", () => {
       organizationId: orgAId,
       userId: await orgMember(orgAId),
       role: "Staff",
+      propertyScope: [],
     };
     const res = await handlePresignUpload(
       jsonReq({ contentType: "text/html", byteSize: 10, kind: "file" }),
@@ -175,6 +176,7 @@ describe("handlePresignUpload — route behaviour", () => {
       organizationId: orgAId,
       userId: await orgMember(orgAId),
       role: "Auditor",
+      propertyScope: [],
     };
     const res = await handlePresignUpload(
       jsonReq({ contentType: "image/jpeg", byteSize: 10, kind: "photo" }),
@@ -191,6 +193,7 @@ describe("handlePresignUpload — route behaviour", () => {
       organizationId: orgAId,
       userId: await orgMember(orgAId),
       role: "Staff",
+      propertyScope: [],
     };
     const res = await handlePresignUpload(
       jsonReq({ contentType: "application/pdf", byteSize: 5000, kind: "file" }),

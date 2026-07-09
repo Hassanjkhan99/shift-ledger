@@ -52,6 +52,13 @@ const eslintConfig = defineConfig([
     "out/**",
     "build/**",
     "next-env.d.ts",
+    // ESLint flat config does not read .gitignore. `.claude/` holds tooling + ephemeral agent git
+    // worktrees (each with its own nested .next build) — never source to lint. The nested build files
+    // otherwise trip no-require-imports / no-this-alias on generated Next output.
+    ".claude/**",
+    // Generated code (Prisma client + graphql-codegen output) is not hand-written and carries codegen
+    // idioms (e.g. `any` in the react-query fetcher) that our rules would flag. Typecheck still covers it.
+    "src/generated/**",
   ]),
   {
     name: "shift-ledger/no-direct-prisma",
