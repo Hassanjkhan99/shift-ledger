@@ -5,6 +5,7 @@
 import Link from "next/link";
 import type { OrgRole } from "@/generated/prisma/enums";
 import type { MemberOrg } from "@/lib/member-orgs";
+import { canManageProperties } from "@/lib/permissions";
 import { NotificationBadge } from "./NotificationBadge";
 import { SignOutButton } from "./SignOutButton";
 import { OrgSwitcher } from "./OrgSwitcher";
@@ -14,8 +15,15 @@ function canSeeExceptions(role: OrgRole): boolean {
   return role !== "Staff";
 }
 
+// Settings (org & sites setup, #133): property managers reach it for outlet management, admins for the
+// full site CRUD. Others don't see it.
+function canSeeSettings(role: OrgRole): boolean {
+  return canManageProperties(role) || role === "PropertyManager";
+}
+
 export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: MemberOrg[] }) {
   const showBadge = canSeeExceptions(role);
+  const showSettings = canSeeSettings(role);
   const currentName = orgs.find((o) => o.id === org)?.name ?? "Shift Ledger";
   const multiOrg = orgs.length > 1;
   return (
@@ -54,6 +62,14 @@ export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: 
             <NotificationBadge org={org} />
           </Link>
         )}
+        {showSettings && (
+          <Link
+            href={`/${org}/settings/properties`}
+            className="mt-1 rounded-md px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+          >
+            Settings
+          </Link>
+        )}
         <SignOutButton className="mt-auto rounded-md px-3 py-2 text-left text-sm font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-60 dark:text-zinc-300 dark:hover:bg-zinc-900" />
       </nav>
 
@@ -80,6 +96,14 @@ export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: 
           >
             Exceptions
             <NotificationBadge org={org} />
+          </Link>
+        )}
+        {showSettings && (
+          <Link
+            href={`/${org}/settings/properties`}
+            className="px-4 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-300"
+          >
+            Settings
           </Link>
         )}
         <SignOutButton className="px-4 py-1 text-xs font-medium text-zinc-700 disabled:opacity-60 dark:text-zinc-300" />
