@@ -1,65 +1,47 @@
-import Image from "next/image";
+// App entry (#132). Replaces the Create-Next-App template with an authed router:
+//   - no session               -> /sign-in?returnTo=…
+//   - explicit non-root returnTo -> honor it (post-auth deep-link)
+//   - authed, no membership     -> /onboarding (create org / accept invite)
+//   - authed, exactly one org   -> /{org}/today
+//   - authed, multiple orgs     -> org picker
+// The decision itself is pure (decideEntry, lib/app-entry) so the redirect matrix is unit-tested; this
+// RSC only wires the session + membership reads to redirect()/render.
+import { redirect } from "next/navigation";
+import { headers } from "next/headers";
+import { getAuth } from "@/lib/auth";
+import { signInUrl } from "@/lib/auth-gate";
+import { decideEntry } from "@/lib/app-entry";
+import { listMemberOrganizations, resolveUserIdByEmail } from "@/lib/member-orgs";
+import { OrgPicker } from "./OrgPicker";
 
-export default function Home() {
-  return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
-  );
+export default async function Home({
+  searchParams,
+}: {
+  searchParams: Promise<{ returnTo?: string }>;
+}) {
+  const { returnTo } = await searchParams;
+  const session = await getAuth().api.getSession({
+    headers: (await headers()) as unknown as Headers,
+  });
+  const email = session?.user?.email ?? null;
+
+  // Resolve the caller's org list only when authenticated (and only when we still need routing — an
+  // explicit returnTo short-circuits before this, but decideEntry needs the list for the 0/1/N split).
+  let orgs: Awaited<ReturnType<typeof listMemberOrganizations>> = [];
+  if (email) {
+    const userId = await resolveUserIdByEmail(email);
+    orgs = userId ? await listMemberOrganizations(userId) : [];
+  }
+
+  const decision = decideEntry({ hasSession: Boolean(email), returnTo, orgs });
+  switch (decision.kind) {
+    case "sign-in":
+      return redirect(signInUrl(decision.returnTo));
+    case "redirect":
+      return redirect(decision.path);
+    case "onboarding":
+      return redirect("/onboarding");
+    case "picker":
+      return <OrgPicker orgs={decision.orgs} />;
+  }
 }
