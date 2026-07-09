@@ -27,10 +27,20 @@ export async function handleExportDownload(
     // RLS scopes this to the caller's org; a cross-tenant job id simply resolves to null.
     const job = await tx.exportJob.findUnique({
       where: { id: jobId },
-      select: { status: true, auditPack: { select: { attachment: { select: { r2Key: true } } } } },
+      select: {
+        status: true,
+        auditPack: {
+          select: { attachment: { select: { r2Key: true, status: true, deletedAt: true } } },
+        },
+      },
     });
-    if (!job || job.status !== "completed" || !job.auditPack?.attachment) return null;
-    return deps.store.presignGet(job.auditPack.attachment.r2Key);
+    const att = job?.auditPack?.attachment;
+    // #120: only mint a signed URL for a completed job whose pack object is still a live, finalized
+    // attachment. A retention-tombstoned or not-yet-uploaded object must 404 (mirror the evidence view).
+    if (!job || job.status !== "completed" || !att || att.status !== "uploaded" || att.deletedAt) {
+      return null;
+    }
+    return deps.store.presignGet(att.r2Key);
   });
   if (!view) return new Response(null, { status: 404 });
 
