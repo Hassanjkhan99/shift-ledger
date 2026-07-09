@@ -9,6 +9,7 @@ import type { ReactNode } from "react";
 import { getAuth } from "@/lib/auth";
 import { resolveMemberForEmail } from "@/lib/http-auth";
 import { decideAuthGate, signInUrl } from "@/lib/auth-gate";
+import { listMemberOrganizations } from "@/lib/member-orgs";
 import { Providers } from "@/app/providers";
 import { OrgNav } from "./OrgNav";
 
@@ -35,10 +36,14 @@ export default async function OrgLayout({
   if (gate.kind === "sign-in") redirect(signInUrl(gate.returnTo));
   if (gate.kind === "not-found") notFound();
 
+  // The member's org list powers the shell's active-org label + switcher (#132). Keyed on the caller's
+  // own users.id (gate.ctx.userId), so it only ever lists orgs this user actively belongs to.
+  const orgs = await listMemberOrganizations(gate.ctx.userId);
+
   return (
     <Providers>
       <div className="flex min-h-full flex-col md:flex-row">
-        <OrgNav org={org} role={gate.ctx.role} />
+        <OrgNav org={org} role={gate.ctx.role} orgs={orgs} />
         <main className="flex-1 px-4 pb-24 pt-4 md:pb-8 md:pl-64">{children}</main>
       </div>
     </Providers>
