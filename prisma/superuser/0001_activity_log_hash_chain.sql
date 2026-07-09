@@ -41,6 +41,7 @@ DECLARE
   v_prev text;
   v_seq bigint;
   v_id uuid := uuidv7();
+  v_created_at timestamptz := clock_timestamp();
   v_payload text;
   v_hash text;
 BEGIN
@@ -69,20 +70,27 @@ BEGIN
    LIMIT 1;
   v_seq := coalesce(v_seq, 0) + 1;
 
-  -- Canonical payload (chr(31) = unit separator, unambiguous). row_hash = H(prev || canonical(row)).
-  v_payload := coalesce(v_prev, '') || chr(31) || v_id::text || chr(31) || v_org::text || chr(31)
+  -- Canonical payload (chr(31) = unit separator). row_hash = H(prev || canonical(row)). NULLABLE fields
+  -- use a NULL-distinct marker: present => chr(1)||value, NULL => chr(2). So NULL and '' hash DIFFERENTLY
+  -- (chr(2) vs chr(1)), closing the coalesce(...,'') ambiguity. created_at is set HERE (not left to the
+  -- column default) and folded in, so the audit timestamp is inside the tamper-evident hash too.
+  v_payload := coalesce(chr(1) || v_prev, chr(2)) || chr(31)
+    || v_id::text || chr(31) || v_org::text || chr(31)
     || p_subject_type::text || chr(31) || p_subject_id::text || chr(31) || p_action || chr(31)
-    || coalesce(p_actor_user_id::text, '') || chr(31) || coalesce(p_actor_label, '') || chr(31)
-    || coalesce(p_before::text, '') || chr(31) || coalesce(p_after::text, '') || chr(31)
-    || coalesce(p_reason, '') || chr(31) || v_seq::text;
+    || coalesce(chr(1) || p_actor_user_id::text, chr(2)) || chr(31)
+    || coalesce(chr(1) || p_actor_label, chr(2)) || chr(31)
+    || coalesce(chr(1) || p_before::text, chr(2)) || chr(31)
+    || coalesce(chr(1) || p_after::text, chr(2)) || chr(31)
+    || coalesce(chr(1) || p_reason, chr(2)) || chr(31)
+    || v_seq::text || chr(31) || v_created_at::text;
   v_hash := encode(sha256(convert_to(v_payload, 'UTF8')), 'hex');
 
   INSERT INTO activity_log
     (id, organization_id, subject_type, subject_id, action, actor_user_id, actor_label,
-     before_json, after_json, reason, chain_seq, prev_hash, row_hash)
+     before_json, after_json, reason, chain_seq, prev_hash, row_hash, created_at)
   VALUES
     (v_id, v_org, p_subject_type, p_subject_id, p_action, p_actor_user_id, p_actor_label,
-     p_before, p_after, p_reason, v_seq, v_prev, v_hash);
+     p_before, p_after, p_reason, v_seq, v_prev, v_hash, v_created_at);
 
   RETURN v_id;
 END;
@@ -117,11 +125,16 @@ BEGIN
     IF r.prev_hash IS DISTINCT FROM v_prev THEN
       RETURN false; -- broken linkage (reorder / missing predecessor)
     END IF;
-    v_payload := coalesce(v_prev, '') || chr(31) || r.id::text || chr(31) || r.organization_id::text
-      || chr(31) || r.subject_type::text || chr(31) || r.subject_id::text || chr(31) || r.action
-      || chr(31) || coalesce(r.actor_user_id::text, '') || chr(31) || coalesce(r.actor_label, '')
-      || chr(31) || coalesce(r.before_json::text, '') || chr(31) || coalesce(r.after_json::text, '')
-      || chr(31) || coalesce(r.reason, '') || chr(31) || r.chain_seq::text;
+    -- MUST byte-for-byte match log_activity()'s payload (same marker encoding + created_at).
+    v_payload := coalesce(chr(1) || v_prev, chr(2)) || chr(31)
+      || r.id::text || chr(31) || r.organization_id::text || chr(31)
+      || r.subject_type::text || chr(31) || r.subject_id::text || chr(31) || r.action || chr(31)
+      || coalesce(chr(1) || r.actor_user_id::text, chr(2)) || chr(31)
+      || coalesce(chr(1) || r.actor_label, chr(2)) || chr(31)
+      || coalesce(chr(1) || r.before_json::text, chr(2)) || chr(31)
+      || coalesce(chr(1) || r.after_json::text, chr(2)) || chr(31)
+      || coalesce(chr(1) || r.reason, chr(2)) || chr(31)
+      || r.chain_seq::text || chr(31) || r.created_at::text;
     v_calc := encode(sha256(convert_to(v_payload, 'UTF8')), 'hex');
     IF v_calc IS DISTINCT FROM r.row_hash THEN
       RETURN false; -- altered content: recomputed hash no longer matches the stored one

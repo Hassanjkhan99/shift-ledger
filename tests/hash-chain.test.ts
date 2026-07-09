@@ -108,4 +108,50 @@ describe("activity_log hash chain (F6)", () => {
     expect(await verify(orgBId)).toBe(true);
     expect(await verify(orgAId)).toBe(true);
   });
+
+  it("verify() catches a tampered created_at and a NULL->'' reason (both are now in the hash)", async () => {
+    // #118: created_at is hashed and NULL is encoded distinctly from ''. Simulate a privileged tamper by
+    // disabling the append-only triggers, mutating a row, checking verify(), then EXACTLY reversing the
+    // change so the chain is left intact for other tests (reversible interval math / restore-to-NULL).
+    await withTenant(orgBId, (tx) =>
+      logActivity(tx, {
+        organizationId: orgBId,
+        subjectType: "organization",
+        subjectId: orgBId,
+        action: "hashchain.test.tamper",
+        actorLabel: "system:test", // reason stays NULL
+      }),
+    );
+
+    const r = await withTenant(orgBId, async (tx) => {
+      const [{ id }] = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM activity_log
+         WHERE organization_id = ${orgBId}::uuid AND action = 'hashchain.test.tamper'
+         ORDER BY chain_seq DESC LIMIT 1`;
+      const ok = async (): Promise<boolean> =>
+        (await tx.$queryRaw<{ ok: boolean }[]>`SELECT verify_activity_chain() AS ok`)[0].ok;
+
+      await tx.$executeRawUnsafe(`ALTER TABLE "activity_log" DISABLE TRIGGER USER`);
+      try {
+        await tx.$executeRaw`UPDATE activity_log SET created_at = created_at + interval '1 second' WHERE id = ${id}::uuid`;
+        const tamperedTime = await ok();
+        await tx.$executeRaw`UPDATE activity_log SET created_at = created_at - interval '1 second' WHERE id = ${id}::uuid`;
+        const restoredTime = await ok();
+
+        await tx.$executeRaw`UPDATE activity_log SET reason = '' WHERE id = ${id}::uuid`;
+        const tamperedReason = await ok();
+        await tx.$executeRaw`UPDATE activity_log SET reason = NULL WHERE id = ${id}::uuid`;
+        const restoredReason = await ok();
+        return { tamperedTime, restoredTime, tamperedReason, restoredReason };
+      } finally {
+        await tx.$executeRawUnsafe(`ALTER TABLE "activity_log" ENABLE TRIGGER USER`);
+      }
+    });
+
+    expect(r.tamperedTime).toBe(false); // created_at is inside the hash
+    expect(r.restoredTime).toBe(true);
+    expect(r.tamperedReason).toBe(false); // NULL and '' hash differently now
+    expect(r.restoredReason).toBe(true);
+    expect(await verify(orgBId)).toBe(true); // chain left intact for other tests
+  });
 });
