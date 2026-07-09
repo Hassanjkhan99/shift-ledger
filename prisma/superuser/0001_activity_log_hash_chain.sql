@@ -32,7 +32,9 @@ CREATE OR REPLACE FUNCTION log_activity(
 ) RETURNS uuid
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+-- pg_temp LAST so an unqualified `activity_log` can never resolve to a caller-created temp table that
+-- shadows the real one (a SECURITY DEFINER temp-shadowing bypass); public resolves first.
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 DECLARE
   v_org uuid := nullif(current_setting('app.current_org_id', true), '')::uuid;
@@ -50,6 +52,11 @@ BEGIN
   -- must fail the whole transaction (mirrors the activity_log RLS WITH CHECK the direct path enforced).
   IF p_organization_id IS DISTINCT FROM v_org THEN
     RAISE EXCEPTION 'log_activity: organization mismatch (claimed %, tenant context %)', p_organization_id, v_org;
+  END IF;
+  -- Exactly one actor (mirrors logActivity()'s TS check). This function is the DB-sanctioned append API
+  -- granted to app_user, so it must also reject unattributed/ambiguous rows from any raw-SQL caller.
+  IF (p_actor_user_id IS NOT NULL) = (p_actor_label IS NOT NULL AND btrim(p_actor_label) <> '') THEN
+    RAISE EXCEPTION 'log_activity: exactly one of actor_user_id / actor_label (non-blank) is required';
   END IF;
 
   -- Serialize this org's chain so concurrent appends link deterministically (per-org, not global).
@@ -88,7 +95,9 @@ $$;
 CREATE OR REPLACE FUNCTION verify_activity_chain() RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+-- pg_temp LAST so an unqualified `activity_log` can never resolve to a caller-created temp table that
+-- shadows the real one (a SECURITY DEFINER temp-shadowing bypass); public resolves first.
+SET search_path = pg_catalog, public, pg_temp
 AS $$
 DECLARE
   v_org uuid := nullif(current_setting('app.current_org_id', true), '')::uuid;
@@ -130,7 +139,9 @@ $$;
 CREATE OR REPLACE FUNCTION activity_chain_head() RETURNS text
 LANGUAGE sql
 SECURITY DEFINER
-SET search_path = public
+-- pg_temp LAST so an unqualified `activity_log` can never resolve to a caller-created temp table that
+-- shadows the real one (a SECURITY DEFINER temp-shadowing bypass); public resolves first.
+SET search_path = pg_catalog, public, pg_temp
 AS $$
   SELECT row_hash FROM activity_log
    WHERE organization_id = nullif(current_setting('app.current_org_id', true), '')::uuid
@@ -160,7 +171,12 @@ CREATE TRIGGER activity_log_enforce_writer
   BEFORE INSERT ON activity_log
   FOR EACH ROW EXECUTE FUNCTION activity_log_enforce_writer();
 
--- app_user may CALL the functions but not reproduce them.
+-- REVOKE the implicit PUBLIC EXECUTE first: Postgres grants EXECUTE to PUBLIC on new functions by
+-- default, and these are SECURITY DEFINER (RLS-bypassing), so any OTHER login role could otherwise set
+-- app.current_org_id and append/read a tenant's audit chain. Only app_user may CALL them.
+REVOKE ALL ON FUNCTION log_activity(uuid, activity_subject_type, uuid, text, uuid, text, jsonb, jsonb, text) FROM PUBLIC;
+REVOKE ALL ON FUNCTION verify_activity_chain() FROM PUBLIC;
+REVOKE ALL ON FUNCTION activity_chain_head() FROM PUBLIC;
 GRANT EXECUTE ON FUNCTION log_activity(uuid, activity_subject_type, uuid, text, uuid, text, jsonb, jsonb, text) TO app_user;
 GRANT EXECUTE ON FUNCTION verify_activity_chain() TO app_user;
 GRANT EXECUTE ON FUNCTION activity_chain_head() TO app_user;
