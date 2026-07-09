@@ -194,6 +194,20 @@ export function canManageOutlets(
   return false;
 }
 
+// ---- Task templates & scheduling authorship (#135/#136, D7) ---------------------
+// Owner/OrgAdmin/PropertyManager/KitchenManager author templates and schedules.
+const CONFIG_AUTHOR_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([
+  OrgRole.Owner,
+  OrgRole.OrgAdmin,
+  OrgRole.PropertyManager,
+  OrgRole.KitchenManager,
+]);
+
+/** True if `role` may create/edit/deactivate task templates (D7, #135). */
+export function canManageTemplates(role: OrgRole): boolean {
+  return CONFIG_AUTHOR_ROLES.has(role);
+}
+
 // ---- Members & invitations authorization (#134, D7) -----------------------------
 // Owner/OrgAdmin manage the whole roster; a PropertyManager may manage members within their scope.
 

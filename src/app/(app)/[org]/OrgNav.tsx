@@ -5,7 +5,7 @@
 import Link from "next/link";
 import type { OrgRole } from "@/generated/prisma/enums";
 import type { MemberOrg } from "@/lib/member-orgs";
-import { canManageProperties, canManageMembers } from "@/lib/permissions";
+import { canManageProperties, canManageMembers, canManageTemplates } from "@/lib/permissions";
 import { NotificationBadge } from "./NotificationBadge";
 import { SignOutButton } from "./SignOutButton";
 import { OrgSwitcher } from "./OrgSwitcher";
@@ -25,6 +25,7 @@ export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: 
   const showBadge = canSeeExceptions(role);
   const showSettings = canSeeSettings(role);
   const showMembers = canManageMembers(role);
+  const showTemplates = canManageTemplates(role);
   const currentName = orgs.find((o) => o.id === org)?.name ?? "Shift Ledger";
   const multiOrg = orgs.length > 1;
   return (
@@ -61,6 +62,14 @@ export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: 
           >
             Exceptions
             <NotificationBadge org={org} />
+          </Link>
+        )}
+        {showTemplates && (
+          <Link
+            href={`/${org}/settings/templates`}
+            className="mt-1 rounded-md px-3 py-2 text-sm font-medium text-zinc-700 hover:bg-zinc-100 dark:text-zinc-300 dark:hover:bg-zinc-900"
+          >
+            Templates
           </Link>
         )}
         {showMembers && (
@@ -105,6 +114,14 @@ export function OrgNav({ org, role, orgs }: { org: string; role: OrgRole; orgs: 
           >
             Exceptions
             <NotificationBadge org={org} />
+          </Link>
+        )}
+        {showTemplates && (
+          <Link
+            href={`/${org}/settings/templates`}
+            className="px-4 py-1 text-xs font-medium text-zinc-700 dark:text-zinc-300"
+          >
+            Templates
           </Link>
         )}
         {showMembers && (
