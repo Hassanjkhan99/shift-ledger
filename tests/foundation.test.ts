@@ -1,5 +1,6 @@
 import { describe, it, expect, inject, afterAll } from "vitest";
 import { prisma, withTenant, disconnect } from "../src/lib/db";
+import { logActivity } from "../src/lib/transition";
 
 // Ids provided by tests/global-setup.ts after seeding two orgs.
 const orgAId = inject("orgAId");
@@ -99,15 +100,14 @@ describe("RLS cross-tenant isolation (app_user connection)", () => {
 
 describe("activity_log is append-only (database-enforced)", () => {
   it("allows INSERT within the tenant", async () => {
+    // Inserts route through log_activity() (#13); a direct app_user insert is rejected by the guard.
     const row = await withTenant(orgAId, (tx) =>
-      tx.activityLog.create({
-        data: {
-          organizationId: orgAId,
-          subjectType: "organization",
-          subjectId: orgAId,
-          action: "test.insert",
-          actorLabel: "system:test",
-        },
+      logActivity(tx, {
+        organizationId: orgAId,
+        subjectType: "organization",
+        subjectId: orgAId,
+        action: "test.insert",
+        actorLabel: "system:test",
       }),
     );
     expect(row.id).toBeTruthy();

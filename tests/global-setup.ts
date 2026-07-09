@@ -10,6 +10,7 @@ import {
   APP_USER,
   APP_PASSWORD,
 } from "../scripts/pg.mjs";
+import { applySuperuser } from "../scripts/apply-superuser.mjs";
 import { seed } from "../prisma/seed";
 
 const PORT = 5433;
@@ -42,6 +43,12 @@ export default async function setup({
   });
 
   const ids = await seed(SUPER_URL);
+
+  // Elevated step (#13): create the SECURITY DEFINER log_activity()/verify/head functions + the
+  // sole-writer guard trigger as the superuser (app_user, which ran the migrations, cannot). Must run
+  // AFTER migrate+seed and BEFORE any test appends to activity_log via logActivity().
+  await applySuperuser(SUPER_URL);
+
   provide("orgAId", ids.orgAId);
   provide("orgBId", ids.orgBId);
 

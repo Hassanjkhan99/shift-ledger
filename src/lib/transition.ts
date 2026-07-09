@@ -48,27 +48,40 @@ export interface ActivityLogEntry {
 /**
  * Insert one activity_log row inside the caller's transaction.
  *
- * This is the single write path for the audit log — the seam that M3 (#13) will swap for the
- * SECURITY DEFINER hash-chain function. Do NOT insert into activity_log from anywhere else.
+ * This is the single write path for the audit log. As of #13 it calls the SECURITY DEFINER
+ * log_activity() function (prisma/superuser/) instead of a direct Prisma insert: that function computes
+ * the per-org dense chain_seq + prev_hash/row_hash atomically and is the ONLY sanctioned inserter (a
+ * guard trigger rejects direct app_user inserts), so the tamper-evident chain (F6) cannot be forged
+ * from application code. The org is taken from the transaction-local GUC the function shares with RLS,
+ * so `entry.organizationId` is used only for the caller-side attribution assertion. Do NOT insert into
+ * activity_log from anywhere else — go through this seam.
  */
-export function logActivity(tx: TenantClient, entry: ActivityLogEntry): Promise<{ id: string }> {
+export async function logActivity(
+  tx: TenantClient,
+  entry: ActivityLogEntry,
+): Promise<{ id: string }> {
   // Enforce the attribution invariant at the write boundary too, not only in transition() — this
   // is the exported seam every audit write goes through, incl. direct non-status logs.
   assertExactlyOneActor(entry.actorUserId, entry.actorLabel);
-  return tx.activityLog.create({
-    data: {
-      organizationId: entry.organizationId,
-      subjectType: entry.subjectType,
-      subjectId: entry.subjectId,
-      action: entry.action,
-      actorUserId: entry.actorUserId ?? null,
-      actorLabel: entry.actorLabel ?? null,
-      beforeJson: entry.beforeJson ?? undefined,
-      afterJson: entry.afterJson ?? undefined,
-      reason: entry.reason ?? null,
-    },
-    select: { id: true },
-  });
+  const before = entry.beforeJson === undefined ? null : JSON.stringify(entry.beforeJson);
+  const after = entry.afterJson === undefined ? null : JSON.stringify(entry.afterJson);
+  // Prisma enum values are camelCase (e.g. 'taskOccurrence'); the DB enum uses the @map'd snake_case
+  // ('task_occurrence'). The normal Prisma insert path translates this, but our raw call must do it —
+  // camelCase->snake_case is a no-op for already-snake / unmapped values, so it is safe for all members.
+  const dbSubjectType = entry.subjectType.replace(/([A-Z])/g, "_$1").toLowerCase();
+  const rows = await tx.$queryRaw<{ id: string }[]>`
+    SELECT log_activity(
+      ${entry.organizationId}::uuid,
+      ${dbSubjectType}::activity_subject_type,
+      ${entry.subjectId}::uuid,
+      ${entry.action},
+      ${entry.actorUserId ?? null}::uuid,
+      ${entry.actorLabel ?? null},
+      ${before}::jsonb,
+      ${after}::jsonb,
+      ${entry.reason ?? null}
+    ) AS id`;
+  return { id: rows[0].id };
 }
 
 /** Options for a single transition. See transition() for the ordering guarantees. */
