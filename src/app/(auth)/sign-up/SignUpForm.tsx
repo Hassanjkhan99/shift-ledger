@@ -37,8 +37,10 @@ export function SignUpForm({ returnTo }: { returnTo: string }) {
     });
     if (authError) {
       setPending(false);
+      // Better Auth surfaces a duplicate email as USER_ALREADY_EXISTS (with a
+      // "_USE_ANOTHER_EMAIL" suffix in some versions) — match the family, not the exact string.
       setError(
-        authError.code === "USER_ALREADY_EXISTS"
+        authError.code?.includes("ALREADY_EXISTS")
           ? "An account with this email already exists."
           : "Could not create your account. Please try again.",
       );
