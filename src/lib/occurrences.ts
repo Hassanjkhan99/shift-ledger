@@ -631,3 +631,60 @@ export function cancelOccurrence(tx: TenantClient, occurrenceId: string, actor: 
     actor,
   );
 }
+
+// ---- Completion status edges (§7.1; M4 #17) -------------------------------------
+// The three completion-driven occurrence edges: due→completed, overdue→completed_late, and
+// due|overdue→failed. This function owns ONLY the occurrence STATUS flip (routed through the F4 choke
+// point, so it is a sanctioned status writer here). The surrounding completion flow — pass/fail
+// evaluation, the F2 idempotent task_completions insert, evidence attachment, and the fail-path
+// Exception + repeated-deviation cascade — lives in the completion orchestrator (complete-occurrence.ts)
+// and calls this after the completion row is written, inside the SAME withTenant transaction.
+
+/** The terminal status a completion drives the occurrence to (§7.1). */
+export type CompletionTransitionTarget = "completed" | "completed_late" | "failed";
+
+/**
+ * Flip an occurrence from its current due/overdue status to a completion terminal status, atomically
+ * with the F4 audit row (transition()). Compare-and-set on `expectedFrom` (the status the orchestrator
+ * read earlier in the same tx): if a concurrent write changed the row, the CAS matches 0 rows and we
+ * THROW so the whole completion transaction — including the just-written completion row — rolls back
+ * (a completion can never persist without its status transition). `completedAt` is stamped on the
+ * happy-path terminals (completed/completed_late); a `failed` occurrence is not "completed" so it is
+ * left null.
+ */
+export async function applyOccurrenceCompletion(
+  tx: TenantClient,
+  args: {
+    organizationId: string;
+    occurrenceId: string;
+    expectedFrom: OccurrenceStatus;
+    target: CompletionTransitionTarget;
+    actorUserId: string;
+    completedAt: Date;
+  },
+): Promise<{ id: string; status: OccurrenceStatus }> {
+  const setCompletedAt = args.target !== "failed";
+  return transition(tx, {
+    organizationId: args.organizationId,
+    subjectType: "taskOccurrence",
+    subjectId: args.occurrenceId,
+    action: `occurrence.${args.target}`,
+    actorUserId: args.actorUserId,
+    before: { status: args.expectedFrom },
+    after: { status: args.target },
+    mutate: async (t) => {
+      const res = await t.taskOccurrence.updateMany({
+        // f4-guard-allow: transition()-wrapped CAS (occurrence completion edge, M4 #17)
+        where: { id: args.occurrenceId, status: args.expectedFrom, deletedAt: null },
+        data: { status: args.target, ...(setCompletedAt ? { completedAt: args.completedAt } : {}) },
+      });
+      if (res.count !== 1) {
+        throw new Error(
+          `occurrence: concurrent modification — completion to '${args.target}' expected status ` +
+            `'${args.expectedFrom}' but the row changed underneath`,
+        );
+      }
+      return { id: args.occurrenceId, status: args.target };
+    },
+  });
+}

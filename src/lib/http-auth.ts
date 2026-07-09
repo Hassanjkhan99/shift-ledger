@@ -25,16 +25,20 @@ export interface MemberContext {
 }
 
 /**
- * Resolve the authenticated member context for an HTTP request, or null if there is no valid session,
- * no selected organization, or the user is not an active member of it. Fail-closed by construction.
+ * Resolve the authenticated member context for a set of request `headers` and an EXPLICIT organization
+ * id, or null if there is no valid session, the org id is malformed, or the user is not an active
+ * member of it. Fail-closed by construction. This is the shared core: the REST seam
+ * (resolveMemberContext) reads the org from the `x-organization-id` header; Server Actions (#17) pass
+ * the active org directly (they have no such header), calling this with `await headers()`.
  */
-export async function resolveMemberContext(req: Request): Promise<MemberContext | null> {
-  const session = await getAuth().api.getSession({ headers: req.headers });
+export async function resolveMemberForOrg(
+  headers: Headers,
+  orgId: string,
+): Promise<MemberContext | null> {
+  if (!UUID_RE.test(orgId)) return null;
+  const session = await getAuth().api.getSession({ headers });
   const email = session?.user?.email;
   if (!email) return null;
-
-  const orgId = req.headers.get("x-organization-id");
-  if (!orgId || !UUID_RE.test(orgId)) return null;
 
   return withTenant(orgId, async (tx) => {
     // `users` is global (no RLS); memberships is RLS-scoped to orgId, so this only finds a membership
@@ -53,4 +57,14 @@ export async function resolveMemberContext(req: Request): Promise<MemberContext 
       propertyScope: membership.propertyScope,
     };
   });
+}
+
+/**
+ * Resolve the authenticated member context for an HTTP request, or null if there is no valid session,
+ * no selected organization, or the user is not an active member of it. Fail-closed by construction.
+ */
+export async function resolveMemberContext(req: Request): Promise<MemberContext | null> {
+  const orgId = req.headers.get("x-organization-id");
+  if (!orgId) return null;
+  return resolveMemberForOrg(req.headers, orgId);
 }
