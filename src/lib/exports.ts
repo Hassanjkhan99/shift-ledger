@@ -113,6 +113,14 @@ export async function processExportJob(
       const recordCount = await tx.taskCompletion.count({
         where: { organizationId, ...recordedAtRange(filters) },
       });
+      // #120: certify the chain head ONLY if the chain actually verifies. Otherwise the pack would
+      // stamp a "tamper-evident" head onto a chain that fails verification — refuse and fail the job.
+      const [{ ok }] = await tx.$queryRaw<{ ok: boolean }[]>`SELECT verify_activity_chain() AS ok`;
+      if (!ok) {
+        throw new Error(
+          "export: activity chain verification failed; refusing to certify a broken head",
+        );
+      }
       const headRows = await tx.$queryRaw<
         { h: string | null }[]
       >`SELECT activity_chain_head() AS h`;

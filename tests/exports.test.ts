@@ -175,4 +175,66 @@ describe("handleExportDownload", () => {
     });
     expect(res.status).toBe(401);
   });
+
+  it("404s when the pack's attachment has been soft-deleted (retention tombstone)", async () => {
+    const store = new InMemoryObjectStore("shift-ledger-eu");
+    const uid = await member(orgAId);
+    const jobId = await enqueue(orgAId);
+    const res0 = await processExportJob(store, { organizationId: orgAId, jobId });
+    const pack = await withTenant(orgAId, (tx) =>
+      tx.auditPack.findUniqueOrThrow({
+        where: { id: res0.auditPackId! },
+        select: { attachmentId: true },
+      }),
+    );
+    // Tombstone the pack's attachment (allowed by the write-once guard — deletedAt is not frozen).
+    await withTenant(orgAId, (tx) =>
+      tx.attachment.update({ where: { id: pack.attachmentId }, data: { deletedAt: new Date() } }),
+    );
+    const res = await handleExportDownload(req, jobId, { resolveContext: ctx(orgAId, uid), store });
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("#120 audit-pack immutability + verify-before-export", () => {
+  it("rejects UPDATE on an audit_pack (immutable inspection evidence)", async () => {
+    const store = new InMemoryObjectStore("shift-ledger-eu");
+    const jobId = await enqueue(orgAId);
+    const res = await processExportJob(store, { organizationId: orgAId, jobId });
+    await expect(
+      withTenant(orgAId, (tx) =>
+        tx.auditPack.update({ where: { id: res.auditPackId! }, data: { recordCount: 9999 } }),
+      ),
+    ).rejects.toThrow(/immutable/i);
+  });
+
+  it("fails the export when the activity chain does not verify (no head certified on a broken chain)", async () => {
+    // Commit a tamper to orgB's chain, run an export, expect it to fail (verify_activity_chain -> false),
+    // then reverse the tamper so the chain is intact for other tests. Reversible interval math.
+    const store = new InMemoryObjectStore("shift-ledger-eu");
+    const jobId = await enqueue(orgBId);
+    const rowId = await withTenant(orgBId, async (tx) => {
+      const [{ id }] = await tx.$queryRaw<{ id: string }[]>`
+        SELECT id FROM activity_log
+         WHERE organization_id = ${orgBId}::uuid AND chain_seq IS NOT NULL
+         ORDER BY chain_seq ASC LIMIT 1`;
+      await tx.$executeRawUnsafe(`ALTER TABLE "activity_log" DISABLE TRIGGER USER`);
+      await tx.$executeRaw`UPDATE activity_log SET created_at = created_at + interval '1 second' WHERE id = ${id}::uuid`;
+      await tx.$executeRawUnsafe(`ALTER TABLE "activity_log" ENABLE TRIGGER USER`);
+      return id;
+    });
+
+    await expect(processExportJob(store, { organizationId: orgBId, jobId })).rejects.toThrow();
+    const job = await withTenant(orgBId, (tx) =>
+      tx.exportJob.findUniqueOrThrow({ where: { id: jobId }, select: { status: true } }),
+    );
+    expect(job.status).toBe("failed");
+
+    // Reverse the tamper so orgB's chain verifies again for any later test.
+    await withTenant(orgBId, async (tx) => {
+      await tx.$executeRawUnsafe(`ALTER TABLE "activity_log" DISABLE TRIGGER USER`);
+      await tx.$executeRaw`UPDATE activity_log SET created_at = created_at - interval '1 second' WHERE id = ${rowId}::uuid`;
+      await tx.$executeRawUnsafe(`ALTER TABLE "activity_log" ENABLE TRIGGER USER`);
+    });
+  });
 });
