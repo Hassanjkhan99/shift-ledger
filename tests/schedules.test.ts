@@ -28,7 +28,10 @@ async function actor(orgId: string): Promise<string> {
 
 async function seededOutletId(orgId: string): Promise<string> {
   const o = await withTenant(orgId, (tx) =>
-    tx.outlet.findFirst({ where: { deletedAt: null }, select: { id: true } }),
+    tx.outlet.findFirst({
+      where: { deletedAt: null, property: { deletedAt: null } },
+      select: { id: true },
+    }),
   );
   if (!o) throw new Error("no seeded outlet");
   return o.id;

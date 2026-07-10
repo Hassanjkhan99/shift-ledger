@@ -22,9 +22,24 @@ async function seedOccurrence(): Promise<{ occurrenceId: string }> {
     });
     return u.id;
   });
-  const outletId = await withTenant(orgAId, (tx) =>
-    tx.outlet.findFirst({ where: { deletedAt: null }, select: { id: true } }).then((o) => o!.id),
-  );
+  // Create our own active property + outlet so other tests' archive/tombstone fixtures can't leave us
+  // pointing at an outlet under an archived property (createSchedule rejects those, #157).
+  const outletId = await withTenant(orgAId, async (tx) => {
+    const p = await tx.property.create({
+      data: {
+        organizationId: orgAId,
+        name: `Det Prop ${randomUUID().slice(0, 8)}`,
+        timezone: "Europe/Berlin",
+        countryCode: "DE",
+      },
+      select: { id: true },
+    });
+    const o = await tx.outlet.create({
+      data: { organizationId: orgAId, propertyId: p.id, name: "Det Kitchen" },
+      select: { id: true },
+    });
+    return o.id;
+  });
   const templateId = await withTenant(orgAId, (tx) =>
     createTemplate(tx, {
       organizationId: orgAId,
