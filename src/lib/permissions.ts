@@ -193,3 +193,39 @@ export function canManageOutlets(
   }
   return false;
 }
+
+// ---- Members & invitations authorization (#134, D7) -----------------------------
+// Owner/OrgAdmin manage the whole roster; a PropertyManager may manage members within their scope.
+
+/** True if `role` may reach the members screen + manage teammates at all. */
+export function canManageMembers(role: OrgRole): boolean {
+  return ORG_MANAGER_ROLES.has(role) || role === OrgRole.PropertyManager;
+}
+
+/**
+ * True if an actor may create/edit a membership (or invitation) granting `targetRole` + `targetScope`.
+ * Owner/OrgAdmin: anyone. PropertyManager: may NOT grant Owner/OrgAdmin/PropertyManager, and the target
+ * scope must be non-empty AND a subset of the PM's own scope (a whole-org PM — empty scope — may grant
+ * any non-admin scope). Everyone else: no.
+ */
+export function canAssignMembership(
+  actorRole: OrgRole,
+  actorScope: readonly string[],
+  targetRole: OrgRole,
+  targetScope: readonly string[],
+): boolean {
+  if (ORG_MANAGER_ROLES.has(actorRole)) return true;
+  if (actorRole !== OrgRole.PropertyManager) return false;
+  // A PM cannot mint admins or other managers.
+  if (
+    targetRole === OrgRole.Owner ||
+    targetRole === OrgRole.OrgAdmin ||
+    targetRole === OrgRole.PropertyManager
+  ) {
+    return false;
+  }
+  // The granted scope must be concrete and contained within the PM's own scope.
+  if (targetScope.length === 0) return false;
+  if (actorScope.length === 0) return true; // whole-org PM
+  return targetScope.every((p) => actorScope.includes(p));
+}
