@@ -19,7 +19,7 @@ export type EntryDecision =
 
 export function decideEntry(input: {
   hasSession: boolean;
-  returnTo: string | null | undefined;
+  returnTo: string | string[] | null | undefined;
   orgs: MemberOrg[];
 }): EntryDecision {
   const returnTo = sanitizeReturnTo(input.returnTo);

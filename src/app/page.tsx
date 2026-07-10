@@ -17,7 +17,7 @@ import { OrgPicker } from "./OrgPicker";
 export default async function Home({
   searchParams,
 }: {
-  searchParams: Promise<{ returnTo?: string }>;
+  searchParams: Promise<{ returnTo?: string | string[] }>;
 }) {
   const { returnTo } = await searchParams;
   const session = await getAuth().api.getSession({

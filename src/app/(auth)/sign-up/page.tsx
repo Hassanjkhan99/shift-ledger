@@ -8,7 +8,7 @@ import { SignUpForm } from "./SignUpForm";
 export default async function SignUpPage({
   searchParams,
 }: {
-  searchParams: Promise<{ returnTo?: string }>;
+  searchParams: Promise<{ returnTo?: string | string[] }>;
 }) {
   const { returnTo } = await searchParams;
   const safeReturnTo = sanitizeReturnTo(returnTo);
