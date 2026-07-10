@@ -39,6 +39,28 @@ describe("sanitizeReturnTo (open-redirect guard, #131)", () => {
       expect(sanitizeReturnTo(value)).toBe("/");
     },
   );
+
+  // #153 — backslash tricks (browsers normalize `\` to `/`, so these bounce off-site).
+  it.each(["/\\evil.com", "/\\/evil.com", "\\/evil.com", "/a\\b", "/\\\\evil.com"])(
+    "rejects backslash path %p",
+    (value) => {
+      expect(sanitizeReturnTo(value)).toBe("/");
+    },
+  );
+
+  // #153 — never redirect back to the auth pages themselves (loop / re-show form).
+  it.each(["/sign-in", "/sign-up", "/sign-in?returnTo=/x", "/sign-up#frag"])(
+    "collapses self-referential auth path %p to /",
+    (value) => {
+      expect(sanitizeReturnTo(value)).toBe("/");
+    },
+  );
+
+  it("normalizes a repeated (array) returnTo to its first element", () => {
+    expect(sanitizeReturnTo(["/org-slug/today", "/other"])).toBe("/org-slug/today");
+    expect(sanitizeReturnTo(["//evil.com", "/safe"])).toBe("/"); // first element sanitized
+    expect(sanitizeReturnTo([])).toBe("/");
+  });
 });
 
 describe("signInUrl (#131)", () => {
