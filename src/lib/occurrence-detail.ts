@@ -74,9 +74,16 @@ function parseRequiredEvidence(snapshot: unknown): EvidenceType[] {
 export async function readOccurrenceDetail(
   tx: TenantClient,
   occurrenceId: string,
+  propertyScope: readonly string[] = [],
 ): Promise<OccurrenceDetail | null> {
   const occ = await tx.taskOccurrence.findFirst({
-    where: { id: occurrenceId },
+    // Exclude tombstoned occurrences (Codex #149) and, for a scoped member, occurrences outside their
+    // property scope (#152) — an out-of-scope UUID resolves to null (404), like the Today read.
+    where: {
+      id: occurrenceId,
+      deletedAt: null,
+      ...(propertyScope.length > 0 ? { propertyId: { in: [...propertyScope] } } : {}),
+    },
     select: {
       id: true,
       status: true,

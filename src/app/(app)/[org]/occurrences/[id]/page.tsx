@@ -18,7 +18,9 @@ export default async function OccurrenceDetailPage({
   const ctx = await resolveMemberForOrg((await headers()) as unknown as Headers, org);
   if (!ctx) notFound();
 
-  const detail = await withTenant(ctx.organizationId, (tx) => readOccurrenceDetail(tx, id));
+  const detail = await withTenant(ctx.organizationId, (tx) =>
+    readOccurrenceDetail(tx, id, ctx.propertyScope),
+  );
   if (!detail) notFound();
 
   const actionable = isActionable(detail.status);

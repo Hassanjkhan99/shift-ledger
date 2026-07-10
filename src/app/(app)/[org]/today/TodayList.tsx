@@ -23,6 +23,12 @@ import {
 } from "@/lib/today-optimistic";
 import { completeTaskAction } from "@/app/actions/occurrences";
 
+// A task needs the detail form (not one-click complete) when it takes a temperature reading or requires
+// any evidence — quick-complete would otherwise record it with no reading/evidence (#159).
+function needsInput(occ: TodayOccurrence): boolean {
+  return occ.checkType === "temperature" || (occ.template.requiredEvidence?.length ?? 0) > 0;
+}
+
 export function TodayList({
   org,
   variables,
@@ -170,7 +176,7 @@ function SectionGroup({
               </div>
               <div className="text-xs text-zinc-500">{occ.checkType}</div>
             </Link>
-            {onComplete ? (
+            {onComplete && !needsInput(occ) ? (
               <button
                 type="button"
                 disabled={pendingId === occ.id}
@@ -179,6 +185,14 @@ function SectionGroup({
               >
                 Complete
               </button>
+            ) : onComplete ? (
+              // A reading/evidence task can't be one-click completed — open the detail form (#159).
+              <Link
+                href={`/${org}/occurrences/${occ.id}`}
+                className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                Open
+              </Link>
             ) : (
               <span className="text-xs font-medium text-zinc-500">{occ.status}</span>
             )}

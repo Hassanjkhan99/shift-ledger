@@ -42,8 +42,11 @@ export function CompletionPanel({ org, occurrence }: { org: string; occurrence: 
   function buildEvidence() {
     return occurrence.requiredEvidence
       .map((type) => {
-        if (type === "checkbox") return { type, valueBool: checks[type] ?? false };
-        if (type === "temperature") return { type, valueNumeric: measured };
+        // Only include evidence that was actually provided — an unchecked box or blank reading must NOT
+        // count as present, or the task could be "completed" without the required confirmation (#159).
+        if (type === "checkbox") return checks[type] ? { type, valueBool: true } : null;
+        if (type === "temperature")
+          return measured.trim() !== "" ? { type, valueNumeric: measured } : null;
         if (VALUE_EVIDENCE.has(type)) {
           const v = values[type]?.trim();
           return v ? { type, valueText: v } : null;

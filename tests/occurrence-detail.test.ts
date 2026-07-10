@@ -77,6 +77,18 @@ describe("readOccurrenceDetail (#137)", () => {
     expect(fromB).toBeNull();
   });
 
+  it("hides an occurrence outside the member's property scope (#152)", async () => {
+    const { occurrenceId } = await seedOccurrence();
+    // A scope that does not include the occurrence's property → not found.
+    const outOfScope = await withTenant(orgAId, (tx) =>
+      readOccurrenceDetail(tx, occurrenceId, [randomUUID()]),
+    );
+    expect(outOfScope).toBeNull();
+    // Empty scope (org-admin) still sees it.
+    const admin = await withTenant(orgAId, (tx) => readOccurrenceDetail(tx, occurrenceId, []));
+    expect(admin).not.toBeNull();
+  });
+
   it("isActionable is false for terminal states", () => {
     expect(isActionable("completed")).toBe(false);
     expect(isActionable("failed")).toBe(false);
