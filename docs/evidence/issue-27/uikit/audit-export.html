@@ -1,0 +1,248 @@
+<!-- @dsCard group="Shift Ledger" viewport="1280x820" name="Audit export (desktop)" subtitle="Manager records table + export dialog with non-certification disclaimer" -->
+<!-- @startingPoint section="Screens" subtitle="Manager audit records + export" viewport="1280x820" -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Shift Ledger — Audit records</title>
+<link rel="stylesheet" href="../../styles.css" />
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%}
+  body{font-family:var(--font-sans);background:var(--background);color:var(--foreground);font-size:14px}
+  #root{height:100vh}
+  .app{display:grid;grid-template-columns:248px 1fr;height:100vh}
+  /* Sidebar */
+  .sb{background:var(--sidebar);border-right:1px solid var(--sidebar-border);display:flex;flex-direction:column;padding:12px}
+  .brand{display:flex;align-items:center;gap:10px;padding:8px 8px 14px}
+  .brand .mark{width:32px;height:32px;border-radius:var(--radius-md);background:var(--primary);display:flex;align-items:center;justify-content:center}
+  .brand .mark svg{width:19px;height:19px;color:#fff}
+  .brand .nm{font-weight:700;letter-spacing:-0.02em;font-size:16px}
+  .switch{display:flex;align-items:center;gap:9px;padding:8px 9px;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--card);cursor:pointer;margin-bottom:10px}
+  .switch .av{width:26px;height:26px;border-radius:var(--radius-md);background:var(--primary);color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center}
+  .switch .txt{display:flex;flex-direction:column;line-height:1.2;flex:1;min-width:0}
+  .switch .txt b{font-size:13px;font-weight:600}
+  .switch .txt span{font-size:11px;color:var(--muted-foreground)}
+  .switch svg{width:15px;height:15px;color:var(--muted-foreground)}
+  .grp{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted-foreground);padding:12px 8px 4px}
+  .nav{display:flex;align-items:center;gap:10px;padding:8px 9px;border-radius:var(--radius-md);color:var(--sidebar-foreground);cursor:pointer;font-weight:500;font-size:14px;transition:background .12s}
+  .nav:hover{background:var(--muted)}
+  .nav[aria-current=true]{background:var(--sidebar-accent);color:var(--sidebar-accent-foreground)}
+  .nav svg{width:18px;height:18px;color:var(--muted-foreground)}
+  .nav[aria-current=true] svg{color:var(--sidebar-accent-foreground)}
+  .sbfoot{margin-top:auto;display:flex;align-items:center;gap:10px;padding:8px;border-radius:var(--radius-md)}
+  .sbfoot .av{width:30px;height:30px;border-radius:var(--radius-full);background:var(--slate-200);color:var(--slate-700);font-size:12px;font-weight:600;display:flex;align-items:center;justify-content:center}
+  .sbfoot .txt{line-height:1.2}
+  .sbfoot .txt b{font-size:13px;font-weight:500;display:block}
+  .sbfoot .txt span{font-size:12px;color:var(--muted-foreground)}
+  /* Main */
+  .main{display:flex;flex-direction:column;overflow:hidden}
+  .top{height:60px;flex-shrink:0;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:14px;padding:0 24px}
+  .top h1{margin:0;font-size:20px;font-weight:600;letter-spacing:-0.01em}
+  .top .sub{font-size:13px;color:var(--muted-foreground)}
+  .spacer{flex:1}
+  .search{position:relative;width:240px}
+  .search svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);width:15px;height:15px;color:var(--muted-foreground)}
+  .content{padding:20px 24px;overflow:auto;display:flex;flex-direction:column;gap:16px}
+  /* Filter bar */
+  .filters{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .chip{display:inline-flex;align-items:center;gap:7px;height:36px;padding:0 12px;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--card);font-size:13px;font-weight:500;cursor:pointer;color:var(--foreground)}
+  .chip:hover{background:var(--muted)}
+  .chip svg{width:15px;height:15px;color:var(--muted-foreground)}
+  .chip--active{border-color:var(--primary);color:var(--primary);background:var(--accent)}
+  .chip--active svg{color:var(--primary)}
+  .clearlink{font-size:13px;color:var(--muted-foreground);cursor:pointer;font-weight:500}
+  .clearlink:hover{color:var(--foreground)}
+  /* Table */
+  .tablecard{border:1px solid var(--border);border-radius:var(--radius-xl);overflow:hidden;background:var(--card)}
+  table{width:100%;border-collapse:collapse;font-size:14px}
+  thead th{text-align:left;font-weight:500;color:var(--muted-foreground);padding:11px 16px;font-size:12px;text-transform:uppercase;letter-spacing:.03em;border-bottom:1px solid var(--border);background:var(--surface)}
+  tbody td{padding:12px 16px;border-bottom:1px solid var(--border)}
+  tbody tr:last-child td{border-bottom:0}
+  tbody tr:hover{background:var(--muted)}
+  .mono{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+  .who{display:flex;align-items:center;gap:9px}
+  .who .av{width:26px;height:26px;border-radius:var(--radius-full);background:var(--slate-200);color:var(--slate-700);font-size:11px;font-weight:600;display:flex;align-items:center;justify-content:center}
+  .ev{display:inline-flex;align-items:center;gap:5px;color:var(--muted-foreground);font-size:13px}
+  .ev svg{width:14px;height:14px}
+  .rows-meta{font-size:13px;color:var(--muted-foreground);padding:2px}
+  /* Dialog */
+  .backdrop{position:fixed;inset:0;background:rgba(15,23,42,.45);display:flex;align-items:center;justify-content:center;z-index:1300;animation:fade .2s ease}
+  @keyframes fade{from{opacity:0}to{opacity:1}}
+  .dialog{width:520px;max-width:calc(100vw - 40px);background:var(--popover);border-radius:var(--radius-xl);box-shadow:var(--shadow-2xl);border:1px solid var(--border);overflow:hidden;animation:pop .3s cubic-bezier(0.16,1,0.3,1)}
+  @keyframes pop{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
+  @media (prefers-reduced-motion: reduce){.backdrop,.dialog{animation:none}}
+  .dhead{padding:20px 22px 4px}
+  .dhead h3{margin:0;font-size:18px;font-weight:600;letter-spacing:-0.01em}
+  .dhead p{margin:4px 0 0;font-size:13px;color:var(--muted-foreground)}
+  .dbody{padding:16px 22px;display:flex;flex-direction:column;gap:16px}
+  .field{display:flex;flex-direction:column;gap:6px}
+  .field label{font-size:13px;font-weight:500}
+  .seg{display:flex;gap:8px}
+  .segbtn{flex:1;height:38px;border-radius:var(--radius-md);border:1px solid var(--border);background:var(--card);font-size:14px;font-weight:500;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:7px;color:var(--foreground)}
+  .segbtn svg{width:16px;height:16px}
+  .segbtn--on{border-color:var(--primary);background:var(--accent);color:var(--primary)}
+  .two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .disclaimer{display:flex;gap:11px;background:var(--status-info-bg);border:1px solid color-mix(in oklab,var(--status-info) 30%,transparent);border-radius:var(--radius-lg);padding:13px 14px}
+  .disclaimer svg{width:18px;height:18px;color:var(--status-info-fg);flex-shrink:0;margin-top:1px}
+  .disclaimer p{margin:0;font-size:12.5px;line-height:1.5;color:var(--status-info-fg)}
+  .disclaimer b{font-weight:600}
+  .dfoot{padding:14px 22px 18px;display:flex;justify-content:flex-end;gap:10px;border-top:1px solid var(--border)}
+  .toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:9px;background:var(--slate-900);color:#fff;padding:11px 16px;border-radius:var(--radius-md);font-size:14px;font-weight:500;box-shadow:var(--shadow-lg);z-index:1500}
+  .toast svg{width:17px;height:17px;color:var(--status-pass)}
+  .sl-theme-toggle{position:fixed;bottom:16px;right:16px;z-index:2000;width:40px;height:40px;border-radius:var(--radius-full);border:1px solid var(--border);background:var(--card);color:var(--foreground);display:flex;align-items:center;justify-content:center;cursor:pointer;box-shadow:var(--shadow-md)}
+  .sl-theme-toggle svg{width:18px;height:18px}
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const NS = window.ShadcnUiDesignSystem_fd8ccd;
+const { Button, StatusBadge, Select, Dialog, DialogHeader, DialogTitle, DialogDescription, DialogBody, DialogFooter, DateRangePicker, Combobox, Toaster } = NS;
+const { useState, useRef, useEffect } = React;
+
+function Lucide({ name, cls }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (ref.current && window.lucide) { ref.current.innerHTML=""; const i=document.createElement("i"); i.setAttribute("data-lucide",name); ref.current.appendChild(i); window.lucide.createIcons(); }
+  }, [name]);
+  return <span ref={ref} className={cls} style={{display:"inline-flex"}} />;
+}
+
+const RECORDS = [
+  { time: "16 Sep · 14:58", prop: "Riverside Kitchen", check: "Walk-in fridge temp", result: "pass", val: "3°C", by: "Ana P.", ev: true },
+  { time: "16 Sep · 14:31", prop: "Riverside Kitchen", check: "Hot-hold — pass line", result: "pass", val: "66°C", by: "Ana P.", ev: false },
+  { time: "16 Sep · 13:05", prop: "Riverside Kitchen", check: "Display fridge temp", result: "fail", val: "9°C", by: "Marco R.", ev: true },
+  { time: "16 Sep · 12:00", prop: "Harbour Cafe", check: "Freezer temp", result: "pass", val: "-19°C", by: "Leah T.", ev: false },
+  { time: "16 Sep · 11:42", prop: "Harbour Cafe", check: "Allergen matrix check", result: "pass", val: "—", by: "Leah T.", ev: true },
+  { time: "16 Sep · 09:15", prop: "Riverside Kitchen", check: "Opening checklist", result: "pass", val: "—", by: "Ana P.", ev: false },
+  { time: "15 Sep · 22:40", prop: "Harbour Cafe", check: "Cold-chain — delivery", result: "critical", val: "12°C", by: "System", ev: true },
+];
+
+function ExportDialog({ open, onOpenChange, onDownload }) {
+  const [fmt, setFmt] = useState("pdf");
+  const [busy, setBusy] = useState(false);
+  const [range, setRange] = useState({ from: new Date(2025, 8, 1), to: new Date(2025, 8, 16) });
+  const [scope, setScope] = useState("all");
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogHeader>
+        <DialogTitle>Export audit records</DialogTitle>
+        <DialogDescription>142 records match your current filters.</DialogDescription>
+      </DialogHeader>
+      <DialogBody>
+        <div className="dbody" style={{padding:0}}>
+          <div className="field">
+            <label>Format</label>
+            <div className="seg">
+              <button className={"segbtn" + (fmt==="pdf"?" segbtn--on":"")} onClick={()=>setFmt("pdf")}><Lucide name="file-text" />PDF report</button>
+              <button className={"segbtn" + (fmt==="csv"?" segbtn--on":"")} onClick={()=>setFmt("csv")}><Lucide name="table" />CSV data</button>
+            </div>
+          </div>
+          <div className="field">
+            <label>Date range</label>
+            <DateRangePicker value={range} onChange={setRange} />
+          </div>
+          <div className="field">
+            <label>Scope</label>
+            <Combobox value={scope} onValueChange={setScope}
+              options={[{value:"all",label:"All properties (2)"},{value:"rk",label:"Riverside Kitchen"},{value:"hc",label:"Harbour Cafe"}]} />
+          </div>
+          <div className="disclaimer">
+            <Lucide name="info" />
+            <p><b>Not a certification.</b> This export is a record of self-reported checks logged by staff. It is not an official food-safety certification, accreditation, or audit, and does not guarantee regulatory compliance. Retain alongside your own HACCP records.</p>
+          </div>
+        </div>
+      </DialogBody>
+      <DialogFooter>
+        <Button variant="outline" onClick={()=>onOpenChange(false)}>Cancel</Button>
+        <Button loading={busy} onClick={()=>{ setBusy(true); setTimeout(()=>{ setBusy(false); onDownload(fmt); }, 700); }}>
+          Download {fmt.toUpperCase()}
+        </Button>
+      </DialogFooter>
+    </Dialog>
+  );
+}
+
+function App() {
+  const [open, setOpen] = useState(true);
+  const nav = [
+    ["Dashboard","layout-dashboard"],["Records","clipboard-list",true],["Exceptions","triangle-alert"],
+    ["Timeline","history"],["Team","users"],["Settings","settings"],
+  ];
+  const download = (fmt) => { setOpen(false); Toaster.success({ title: "Export ready", description: fmt.toUpperCase() + " downloaded to your device" }); };
+  return (
+    <div className="app">
+      <aside className="sb">
+        <div className="brand"><span className="mark"><Lucide name="clipboard-check" /></span><span className="nm">Shift Ledger</span></div>
+        <div className="switch"><span className="av">NG</span><span className="txt"><b>Nourish Group</b><span>2 properties</span></span><Lucide name="chevrons-up-down" /></div>
+        <div className="grp">Compliance</div>
+        {nav.map(([label,icon,active]) => (
+          <div key={label} className="nav" aria-current={active||undefined}><Lucide name={icon} />{label}</div>
+        ))}
+        <div className="sbfoot"><span className="av">JD</span><span className="txt"><b>Jordan Diaz</b><span>Compliance manager</span></span></div>
+      </aside>
+      <div className="main">
+        <header className="top">
+          <div><h1>Audit records</h1><div className="sub">Riverside Kitchen · Harbour Cafe</div></div>
+          <div className="spacer" />
+          <div className="search"><Lucide name="search" /><input style={{width:"100%",height:36,borderRadius:"var(--radius-md)",border:"1px solid var(--input)",padding:"0 10px 0 32px",fontFamily:"var(--font-sans)",fontSize:14,background:"transparent",outline:"none"}} placeholder="Search records…" /></div>
+          <Button onClick={()=>setOpen(true)}><Lucide name="download" />Export</Button>
+        </header>
+        <div className="content">
+          <div className="filters">
+            <span className="chip chip--active"><Lucide name="calendar" />Sep 1 – Sep 16</span>
+            <span className="chip"><Lucide name="building-2" />All properties<Lucide name="chevron-down" /></span>
+            <span className="chip"><Lucide name="thermometer" />Check type<Lucide name="chevron-down" /></span>
+            <span className="chip"><Lucide name="circle-dot" />Status<Lucide name="chevron-down" /></span>
+            <span className="clearlink">Clear</span>
+            <div className="spacer" />
+            <span className="rows-meta">142 records</span>
+          </div>
+          <div className="tablecard">
+            <table>
+              <thead><tr><th>Date &amp; time</th><th>Property</th><th>Check</th><th>Result</th><th>Reading</th><th>Recorded by</th><th>Evidence</th></tr></thead>
+              <tbody>
+                {RECORDS.map((r,i) => (
+                  <tr key={i}>
+                    <td className="mono" style={{color:"var(--muted-foreground)",whiteSpace:"nowrap"}}>{r.time}</td>
+                    <td style={{whiteSpace:"nowrap"}}>{r.prop}</td>
+                    <td>{r.check}</td>
+                    <td><StatusBadge status={r.result} size="sm" /></td>
+                    <td className="mono" style={{fontWeight:600}}>{r.val}</td>
+                    <td><div className="who"><span className="av">{r.by==="System"?"SY":r.by.split(" ").map(w=>w[0]).join("")}</span>{r.by}</div></td>
+                    <td>{r.ev ? <span className="ev"><Lucide name="paperclip" />1 photo</span> : <span style={{color:"var(--slate-400)"}}>—</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <div className="rows-meta">Showing 7 of 142 · <span className="clearlink" style={{textDecoration:"underline"}}>Load more</span></div>
+        </div>
+      </div>
+      {<ExportDialog open={open} onOpenChange={setOpen} onDownload={download} />}
+      <Toaster />
+    </div>
+  );
+}
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+<button class="sl-theme-toggle" id="dcTheme" aria-label="Toggle dark mode"></button>
+<script>
+(function(){var root=document.documentElement;
+var SUN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>';
+var MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>';
+try{if(localStorage.getItem('sl-theme')==='dark')root.classList.add('dark');}catch(e){}
+var b=document.getElementById('dcTheme');
+function r(){b.innerHTML=root.classList.contains('dark')?SUN:MOON;}
+b.addEventListener('click',function(){root.classList.toggle('dark');try{localStorage.setItem('sl-theme',root.classList.contains('dark')?'dark':'light');}catch(e){}r();});r();
+})();
+</script>
+</body>
+</html>

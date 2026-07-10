@@ -21,8 +21,28 @@ describe("assertProductionSafety (D13 prod guard)", () => {
       assertProductionSafety({
         ...PROD,
         DATABASE_URL: "postgresql://app:secret@ep-neon-eu.neon.tech/shift_ledger",
+        BETTER_AUTH_SECRET: "a-real-production-secret",
         LOG_LEVEL: "info",
       } as NodeJS.ProcessEnv),
+    ).not.toThrow();
+  });
+
+  it.each(["", "   ", undefined])(
+    "throws in production when BETTER_AUTH_SECRET is missing/blank (%p)",
+    (secret) => {
+      expect(() =>
+        assertProductionSafety({
+          ...PROD,
+          DATABASE_URL: "postgresql://app:secret@ep-neon-eu.neon.tech/shift_ledger",
+          ...(secret === undefined ? {} : { BETTER_AUTH_SECRET: secret }),
+        } as NodeJS.ProcessEnv),
+      ).toThrow(/BETTER_AUTH_SECRET/);
+    },
+  );
+
+  it("does not require BETTER_AUTH_SECRET outside production", () => {
+    expect(() =>
+      assertProductionSafety({ NODE_ENV: "development" } as NodeJS.ProcessEnv),
     ).not.toThrow();
   });
 
@@ -48,7 +68,11 @@ describe("assertProductionSafety (D13 prod guard)", () => {
 
   it("ignores falsy or unset flag values", () => {
     expect(() =>
-      assertProductionSafety({ ...PROD, GRAPHQL_INTROSPECTION: "false" } as NodeJS.ProcessEnv),
+      assertProductionSafety({
+        ...PROD,
+        GRAPHQL_INTROSPECTION: "false",
+        BETTER_AUTH_SECRET: "a-real-production-secret",
+      } as NodeJS.ProcessEnv),
     ).not.toThrow();
   });
 

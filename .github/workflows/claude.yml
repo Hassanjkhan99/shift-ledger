@@ -1,0 +1,47 @@
+name: Claude Code
+
+# On-demand assistant. Triggers only when someone writes "@claude" in an issue,
+# PR comment, or review. Unlike the keyless standup/qa-evidence workflows, this one
+# calls the Anthropic API and therefore REQUIRES a secret (see docs/automation.md):
+#   ANTHROPIC_API_KEY        — pay-as-you-go API key, OR
+#   CLAUDE_CODE_OAUTH_TOKEN  — Claude Pro/Max subscription token (`claude setup-token`)
+# NEVER merges or closes on its own — Done still requires a human merge (CLAUDE.md §4).
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+  issues:
+    types: [opened, assigned]
+  pull_request_review:
+    types: [submitted]
+
+jobs:
+  claude:
+    # Only fire when the trigger text "@claude" is present — never on every event.
+    if: >-
+      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
+      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
+      (github.event_name == 'issues' && (contains(github.event.issue.body, '@claude') || contains(github.event.issue.title, '@claude')))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      id-token: write
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Run Claude Code
+        uses: anthropics/claude-code-action@v1
+        with:
+          # Provide exactly one of these as a repo secret. API key takes precedence if both are set.
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
