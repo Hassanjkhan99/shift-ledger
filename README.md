@@ -12,7 +12,9 @@ environment. See [`.env.example`](.env.example) for the full contract.
   Auth rejects requests whose `Origin` header does not match with `INVALID_ORIGIN`, so a mismatch here
   silently breaks sign-in/sign-up. On Vercel set it **per-environment** to the Preview / Production URL.
 - **`BETTER_AUTH_SECRET`** — signs the session cookie; set a strong random value in every hosted env.
-  The app falls back to a dev-only insecure secret if unset, which is fine only for local dev.
+  The app falls back to a dev-only insecure secret if unset, which is fine only for local dev. In
+  production this is **mandatory**: the D13 boot guard (#166) refuses to start when
+  `NODE_ENV=production` and it is unset/blank, so the insecure fallback can never ship.
 
 ## Database environments (Neon) — #143
 

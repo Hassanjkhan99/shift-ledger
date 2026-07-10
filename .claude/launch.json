@@ -1,0 +1,18 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dev",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["run", "dev", "--", "--port", "3007"],
+      "port": 3007,
+      "autoPort": false
+    },
+    {
+      "name": "uikit-evidence",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "docs/evidence/issue-27/uikit", "-p", "4999", "--no-clipboard"],
+      "port": 4999
+    }
+  ]
+}

@@ -51,6 +51,13 @@ export function assertProductionSafety(env: NodeJS.ProcessEnv = process.env): vo
     violations.push("DATABASE_URL uses local/dev credentials or points at localhost");
   }
 
+  // Better Auth (auth.ts) falls back to a hard-coded dev secret when BETTER_AUTH_SECRET is unset.
+  // That fallback must never reach production — a guessable session secret lets sessions be forged.
+  // Fail closed so a deploy missing the secret refuses to boot instead of silently using the fallback.
+  if (!env.BETTER_AUTH_SECRET || env.BETTER_AUTH_SECRET.trim() === "") {
+    violations.push("BETTER_AUTH_SECRET must be set in production");
+  }
+
   if (violations.length > 0) {
     throw new Error(
       `Refusing to boot — dev-only shortcut(s) detected in production (D13):\n- ${violations.join(
