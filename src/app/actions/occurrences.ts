@@ -87,21 +87,32 @@ const skipInputSchema = z.object({
 
 type CompleteInput = z.infer<typeof completeInputSchema>;
 
-/** Resolve the concrete completion actor (D8) from the request context + optional shared-tablet input. */
-async function resolveActor(
+/**
+ * Resolve the concrete completion actor (D8) from the request context + optional shared-tablet input.
+ *
+ * SECURITY (#152): for the PIN/initials shared-tablet paths the outlet is taken from the TARGET
+ * occurrence (`occurrenceOutletId`), never from the client-supplied `actor.outletId` — otherwise a
+ * crafted request could resolve a picked user against an outlet they belong to while completing a task
+ * on a DIFFERENT outlet. A supplied outletId that disagrees with the occurrence's is rejected.
+ */
+export async function resolveActor(
   tx: TenantClient,
   ctx: MemberContext,
   input: CompleteInput,
+  occurrenceOutletId: string,
 ): Promise<{ actorUserId: string; method: ActorConfirmationMethod }> {
   const actor = input.actor ?? { method: "session" as const };
   if (actor.method === "session") {
     return { actorUserId: ctx.userId, method: "session" };
   }
+  if (actor.outletId !== occurrenceOutletId) {
+    throw new Error("forbidden: actor outlet does not match the occurrence's outlet");
+  }
   if (actor.method === "pin") {
     return resolveCompletionActor(tx, {
       method: "pin",
       organizationId: ctx.organizationId,
-      outletId: actor.outletId,
+      outletId: occurrenceOutletId,
       pickedUserId: actor.pickedUserId,
       pin: actor.pin,
       now: new Date(),
@@ -109,10 +120,32 @@ async function resolveActor(
   }
   return resolveCompletionActor(tx, {
     method: "initials",
-    outletId: actor.outletId,
+    outletId: occurrenceOutletId,
     pickedUserId: actor.pickedUserId,
     initials: actor.initials,
   });
+}
+
+/**
+ * Read the occurrence's real outlet + property (never trust client-supplied ids) and enforce the
+ * member's property scope (#152). Returns null when the occurrence is missing/tombstoned; throws for a
+ * scope violation (surfaced as 403 by the caller). A scoped member (non-empty propertyScope) may only
+ * act on occurrences under their properties; org-wide members (empty scope) may act on any.
+ */
+export async function loadScopedOccurrence(
+  tx: TenantClient,
+  ctx: MemberContext,
+  occurrenceId: string,
+): Promise<{ outletId: string; propertyId: string } | null> {
+  const occ = await tx.taskOccurrence.findFirst({
+    where: { id: occurrenceId, deletedAt: null },
+    select: { outletId: true, propertyId: true },
+  });
+  if (!occ) return null;
+  if (ctx.propertyScope.length > 0 && !ctx.propertyScope.includes(occ.propertyId)) {
+    throw new Error("forbidden: occurrence outside your property scope");
+  }
+  return occ;
 }
 
 /**
@@ -144,7 +177,9 @@ export async function completeTaskAction(raw: unknown): Promise<WriteActionResul
   let result: CompleteOccurrenceResult;
   try {
     result = await withTenant(ctx.organizationId, async (tx) => {
-      const actor = await resolveActor(tx, ctx, input);
+      const occ = await loadScopedOccurrence(tx, ctx, input.occurrenceId);
+      if (!occ) return { status: "not_found" as const, occurrenceId: input.occurrenceId };
+      const actor = await resolveActor(tx, ctx, input, occ.outletId);
       return completeOccurrence(tx, {
         organizationId: ctx.organizationId,
         occurrenceId: input.occurrenceId,
@@ -194,6 +229,9 @@ export async function skipTaskAction(raw: unknown): Promise<WriteActionResult> {
     await withTenant(ctx.organizationId, async (tx) => {
       // Role gate before the transition (the §7.1 who-may-trigger guard is the action's job, #10).
       assertRoleMayTrigger("occurrence", "skip", ctx.role);
+      // Property-scope gate (#152): resolve the occurrence's real property and reject out-of-scope.
+      const occ = await loadScopedOccurrence(tx, ctx, input.occurrenceId);
+      if (!occ) throw new Error("not-found: occurrence does not exist");
       return skipOccurrence(tx, input.occurrenceId, {
         actorUserId: ctx.userId,
         reason: input.reason,
