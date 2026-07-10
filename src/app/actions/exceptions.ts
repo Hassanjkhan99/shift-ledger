@@ -67,6 +67,14 @@ async function run(
       } catch {
         throw new ForbiddenError();
       }
+      // Property-scope gate (#152): a scoped member may only act on exceptions for their properties.
+      if (ctx.propertyScope.length > 0 && exceptionIdForRevalidate) {
+        const exc = await tx.exception.findFirst({
+          where: { id: exceptionIdForRevalidate, deletedAt: null },
+          select: { propertyId: true },
+        });
+        if (!exc || !ctx.propertyScope.includes(exc.propertyId)) throw new ForbiddenError();
+      }
       return work(tx, ctx);
     });
   } catch (err) {

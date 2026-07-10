@@ -42,18 +42,23 @@ export function ExceptionTriage({
   exceptionId,
   status,
   role,
+  hasOpenCorrectiveActions,
 }: {
   org: string;
   exceptionId: string;
   status: ExceptionStatus;
   role: OrgRole;
+  hasOpenCorrectiveActions: boolean;
 }) {
   const router = useRouter();
   const [reason, setReason] = useState("");
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const edges = (EDGES_FROM[status] ?? []).filter((e) => roleMayTrigger("exception", e, role));
+  const edges = (EDGES_FROM[status] ?? [])
+    .filter((e) => roleMayTrigger("exception", e, role))
+    // Resolve is rejected server-side while any CA is still open — don't offer it then (#160).
+    .filter((e) => e !== "resolve" || !hasOpenCorrectiveActions);
   if (edges.length === 0) {
     return (
       <p className="text-xs text-zinc-500 dark:text-zinc-400">

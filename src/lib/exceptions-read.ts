@@ -29,14 +29,21 @@ export interface ExceptionListPage {
 /** Keyset-paginated exceptions list (F5 — cursor seek, never row-skipping), newest first, filterable. */
 export async function listExceptions(
   tx: TenantClient,
-  opts: { status?: ExceptionStatus; cursor?: string | null; limit?: number } = {},
+  opts: {
+    status?: ExceptionStatus;
+    cursor?: string | null;
+    limit?: number;
+    propertyScope?: readonly string[];
+  } = {},
 ): Promise<ExceptionListPage> {
   const limit = opts.limit ?? 20;
   const cursorValues = opts.cursor ? decodeCursor(opts.cursor) : null;
+  const scope = opts.propertyScope ?? [];
   const rows = await tx.exception.findMany({
     where: {
       deletedAt: null,
       ...(opts.status ? { status: opts.status } : {}),
+      ...(scope.length > 0 ? { propertyId: { in: [...scope] } } : {}), // #152 scope
       ...buildKeysetWhere(LIST_KEYS, cursorValues),
     },
     orderBy: buildKeysetOrderBy(LIST_KEYS),
@@ -82,6 +89,7 @@ export interface ExceptionDetailView {
   detail: string | null;
   status: ExceptionStatus;
   severity: string;
+  propertyId: string;
   outletName: string;
   openedAt: string;
   occurrenceId: string;
@@ -91,15 +99,22 @@ export interface ExceptionDetailView {
 export async function getExceptionDetail(
   tx: TenantClient,
   exceptionId: string,
+  propertyScope: readonly string[] = [],
 ): Promise<ExceptionDetailView | null> {
   const e = await tx.exception.findFirst({
-    where: { id: exceptionId, deletedAt: null },
+    // Out-of-scope exceptions are invisible to a scoped member (#152) — resolve to null (404).
+    where: {
+      id: exceptionId,
+      deletedAt: null,
+      ...(propertyScope.length > 0 ? { propertyId: { in: [...propertyScope] } } : {}),
+    },
     select: {
       id: true,
       title: true,
       detail: true,
       status: true,
       severity: true,
+      propertyId: true,
       openedAt: true,
       taskOccurrenceId: true,
       outlet: { select: { name: true } },
@@ -125,6 +140,7 @@ export async function getExceptionDetail(
     detail: e.detail,
     status: e.status,
     severity: e.severity,
+    propertyId: e.propertyId,
     outletName: e.outlet.name,
     openedAt: e.openedAt.toISOString(),
     occurrenceId: e.taskOccurrenceId,

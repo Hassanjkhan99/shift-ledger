@@ -8,6 +8,7 @@ import { resolveMemberForOrg } from "@/lib/http-auth";
 import { withTenant } from "@/lib/db";
 import { getExceptionDetail } from "@/lib/exceptions-read";
 import { listMembers } from "@/lib/members";
+import { roleMayTrigger } from "@/lib/permissions";
 import { ExceptionTriage } from "./ExceptionTriage";
 import { CorrectiveActionsPanel } from "./CorrectiveActionsPanel";
 
@@ -20,9 +21,13 @@ export default async function ExceptionDetailPage({
   const ctx = await resolveMemberForOrg((await headers()) as unknown as Headers, org);
   if (!ctx || ctx.role === "Staff") notFound();
 
+  // Only fetch the roster for members who can actually assign a CA — don't serialize it to ShiftLeader/
+  // Auditor/ExternalInspector clients that can't assign (#160). Org-admins bypass the property scope (#152).
+  const isOrgAdmin = ctx.role === "Owner" || ctx.role === "OrgAdmin";
+  const canAssign = roleMayTrigger("correctiveAction", "assign", ctx.role);
   const { detail, members } = await withTenant(ctx.organizationId, async (tx) => {
-    const detail = await getExceptionDetail(tx, id);
-    const members = detail ? await listMembers(tx) : [];
+    const detail = await getExceptionDetail(tx, id, isOrgAdmin ? [] : ctx.propertyScope);
+    const members = detail && canAssign ? await listMembers(tx) : [];
     return { detail, members };
   });
   if (!detail) notFound();
@@ -30,6 +35,10 @@ export default async function ExceptionDetailPage({
   const memberOptions = members
     .filter((m) => m.status === "active")
     .map((m) => ({ userId: m.userId, label: m.name ?? m.email }));
+  // A parent with any non-terminal (not done/verified) CA cannot be resolved yet (#160).
+  const hasOpenCorrectiveActions = detail.correctiveActions.some(
+    (ca) => ca.status !== "done" && ca.status !== "verified",
+  );
 
   return (
     <div className="mx-auto w-full max-w-2xl space-y-6">
@@ -66,12 +75,19 @@ export default async function ExceptionDetailPage({
 
       <div className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
         <h2 className="mb-2 text-sm font-semibold text-zinc-900 dark:text-zinc-100">Triage</h2>
-        <ExceptionTriage org={org} exceptionId={detail.id} status={detail.status} role={ctx.role} />
+        <ExceptionTriage
+          org={org}
+          exceptionId={detail.id}
+          status={detail.status}
+          role={ctx.role}
+          hasOpenCorrectiveActions={hasOpenCorrectiveActions}
+        />
       </div>
 
       <CorrectiveActionsPanel
         org={org}
         exceptionId={detail.id}
+        parentStatus={detail.status}
         correctiveActions={detail.correctiveActions}
         role={ctx.role}
         members={memberOptions}

@@ -37,12 +37,14 @@ const inp =
 export function CorrectiveActionsPanel({
   org,
   exceptionId,
+  parentStatus,
   correctiveActions,
   role,
   members,
 }: {
   org: string;
   exceptionId: string;
+  parentStatus: string;
   correctiveActions: CA[];
   role: OrgRole;
   members: Member[];
@@ -89,6 +91,7 @@ export function CorrectiveActionsPanel({
               key={ca.id}
               org={org}
               exceptionId={exceptionId}
+              parentStatus={parentStatus}
               ca={ca}
               role={role}
               members={members}
@@ -130,6 +133,7 @@ export function CorrectiveActionsPanel({
 function CaRow({
   org,
   exceptionId,
+  parentStatus,
   ca,
   role,
   members,
@@ -137,6 +141,7 @@ function CaRow({
 }: {
   org: string;
   exceptionId: string;
+  parentStatus: string;
   ca: CA;
   role: OrgRole;
   members: Member[];
@@ -150,8 +155,13 @@ function CaRow({
   const [assignUser, setAssignUser] = useState(members[0]?.userId ?? "");
   const [dueAt, setDueAt] = useState("");
 
+  // assignCorrectiveAction requires the parent to be acknowledged/in_progress — don't offer Assign
+  // before the acknowledge step (incl. the reject → reopened rework path), or it always fails (#160).
+  const parentReady = parentStatus === "acknowledged" || parentStatus === "in_progress";
   const canAssign =
-    ["open", "rejected"].includes(ca.status) && roleMayTrigger("correctiveAction", "assign", role);
+    ["open", "rejected"].includes(ca.status) &&
+    parentReady &&
+    roleMayTrigger("correctiveAction", "assign", role);
   const canDone = ca.status === "assigned" && roleMayTrigger("correctiveAction", "markDone", role);
   const canVerify = ca.status === "done" && roleMayTrigger("correctiveAction", "verify", role);
   const canReject = ca.status === "done" && roleMayTrigger("correctiveAction", "reject", role);
@@ -177,7 +187,7 @@ function CaRow({
           <span className="block text-xs text-zinc-500 dark:text-zinc-400">
             {ca.status}
             {ca.assigneeLabel || ca.assigneeRole ? ` · ${ca.assigneeLabel ?? ca.assigneeRole}` : ""}
-            {ca.dueAt ? ` · due ${new Date(ca.dueAt).toLocaleDateString()}` : ""}
+            {ca.dueAt ? ` · due ${ca.dueAt.slice(0, 10)}` : ""}
           </span>
         </span>
         <span className="flex shrink-0 gap-2">

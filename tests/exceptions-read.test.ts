@@ -24,7 +24,10 @@ async function seedException(title: string): Promise<string> {
     return u.id;
   });
   const outlet = await withTenant(orgAId, (tx) =>
-    tx.outlet.findFirst({ where: { deletedAt: null }, select: { id: true, propertyId: true } }),
+    tx.outlet.findFirst({
+      where: { deletedAt: null, property: { deletedAt: null } },
+      select: { id: true, propertyId: true },
+    }),
   );
   const templateId = await withTenant(orgAId, (tx) =>
     createTemplate(tx, {
@@ -107,5 +110,30 @@ describe("exceptions read (#138)", () => {
 
     const fromB = await withTenant(orgBId, (tx) => getExceptionDetail(tx, id));
     expect(fromB).toBeNull();
+  });
+
+  it("scopes list + detail to the member's properties (#152)", async () => {
+    const id = await seedException(`Scoped ${randomUUID().slice(0, 6)}`);
+    const propertyId = await withTenant(orgAId, (tx) =>
+      tx.exception
+        .findUniqueOrThrow({ where: { id }, select: { propertyId: true } })
+        .then((e) => e.propertyId),
+    );
+
+    // Out-of-scope: list excludes it and detail is null.
+    const outList = await withTenant(orgAId, (tx) =>
+      listExceptions(tx, { limit: 100, propertyScope: [randomUUID()] }),
+    );
+    expect(outList.items.find((e) => e.id === id)).toBeUndefined();
+    const outDetail = await withTenant(orgAId, (tx) => getExceptionDetail(tx, id, [randomUUID()]));
+    expect(outDetail).toBeNull();
+
+    // In-scope: both resolve.
+    const inList = await withTenant(orgAId, (tx) =>
+      listExceptions(tx, { limit: 100, propertyScope: [propertyId] }),
+    );
+    expect(inList.items.find((e) => e.id === id)).toBeDefined();
+    const inDetail = await withTenant(orgAId, (tx) => getExceptionDetail(tx, id, [propertyId]));
+    expect(inDetail).not.toBeNull();
   });
 });

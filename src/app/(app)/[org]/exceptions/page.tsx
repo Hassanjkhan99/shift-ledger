@@ -28,7 +28,17 @@ export default async function ExceptionsPage({
   if (!ctx || ctx.role === "Staff") notFound();
 
   const status = parseStatus(statusParam);
-  const page = await withTenant(ctx.organizationId, (tx) => listExceptions(tx, { status, cursor }));
+  // Org-admins see all; scoped members only their properties' exceptions (#152). A malformed ?cursor=
+  // must not 500 the route — fall back to the first page (#161).
+  const isOrgAdmin = ctx.role === "Owner" || ctx.role === "OrgAdmin";
+  const propertyScope = isOrgAdmin ? [] : ctx.propertyScope;
+  const page = await withTenant(ctx.organizationId, async (tx) => {
+    try {
+      return await listExceptions(tx, { status, cursor, propertyScope });
+    } catch {
+      return listExceptions(tx, { status, propertyScope });
+    }
+  });
 
   const filterHref = (s?: string) => `/${org}/exceptions${s ? `?status=${s}` : ""}`;
 
