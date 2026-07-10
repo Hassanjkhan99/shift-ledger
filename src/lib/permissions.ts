@@ -163,3 +163,33 @@ const EVIDENCE_WRITE_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([
 export function canWriteEvidence(role: OrgRole): boolean {
   return EVIDENCE_WRITE_ROLES.has(role);
 }
+
+// ---- Org & sites management authorization (#133, D7) ----------------------------
+// Organization + property management is org-wide administration: Owner / OrgAdmin only. Outlet
+// management is delegated to the PropertyManager, but ONLY within their property scope (a membership's
+// property_scope; empty = whole org). This is the role/scope dimension for the settings CRUD Server
+// Actions — distinct from the ROLE_MATRIX above, which governs the occurrence/exception/CA state
+// machines, not site administration.
+const ORG_MANAGER_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([OrgRole.Owner, OrgRole.OrgAdmin]);
+
+/** True if `role` may create/edit/archive properties (and the organization). Owner/OrgAdmin only. */
+export function canManageProperties(role: OrgRole): boolean {
+  return ORG_MANAGER_ROLES.has(role);
+}
+
+/**
+ * True if `role` may create/edit/archive outlets under the property `propertyId`. Owner/OrgAdmin may
+ * manage any outlet; a PropertyManager may manage outlets only within their `propertyScope`
+ * (an empty scope means the whole org). All other roles: no.
+ */
+export function canManageOutlets(
+  role: OrgRole,
+  propertyScope: readonly string[],
+  propertyId: string,
+): boolean {
+  if (ORG_MANAGER_ROLES.has(role)) return true;
+  if (role === OrgRole.PropertyManager) {
+    return propertyScope.length === 0 || propertyScope.includes(propertyId);
+  }
+  return false;
+}
