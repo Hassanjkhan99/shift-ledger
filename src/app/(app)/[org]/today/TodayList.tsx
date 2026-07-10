@@ -6,6 +6,7 @@
 // this cache reconcile. The row grouping + optimistic transform are the pure, unit-tested helpers in
 // today-optimistic.ts.
 import { useMemo, useState } from "react";
+import Link from "next/link";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   useOccurrencesTodayQuery,
@@ -21,6 +22,12 @@ import {
   type TodayOccurrence,
 } from "@/lib/today-optimistic";
 import { completeTaskAction } from "@/app/actions/occurrences";
+
+// A task needs the detail form (not one-click complete) when it takes a temperature reading or requires
+// any evidence — quick-complete would otherwise record it with no reading/evidence (#159).
+function needsInput(occ: TodayOccurrence): boolean {
+  return occ.checkType === "temperature" || (occ.template.requiredEvidence?.length ?? 0) > 0;
+}
 
 export function TodayList({
   org,
@@ -97,6 +104,7 @@ export function TodayList({
             {section.outlet.name}
           </h2>
           <SectionGroup
+            org={org}
             label="Overdue"
             tone="overdue"
             items={section.overdue}
@@ -106,6 +114,7 @@ export function TodayList({
             pendingId={complete.isPending ? complete.variables?.occurrenceId : undefined}
           />
           <SectionGroup
+            org={org}
             label="Due"
             tone="due"
             items={section.due}
@@ -114,7 +123,7 @@ export function TodayList({
             }
             pendingId={complete.isPending ? complete.variables?.occurrenceId : undefined}
           />
-          <SectionGroup label="Done" tone="done" items={section.done} />
+          <SectionGroup org={org} label="Done" tone="done" items={section.done} />
         </section>
       ))}
 
@@ -131,12 +140,14 @@ export function TodayList({
 }
 
 function SectionGroup({
+  org,
   label,
   tone,
   items,
   onComplete,
   pendingId,
 }: {
+  org: string;
   label: string;
   tone: "due" | "overdue" | "done";
   items: TodayOccurrence[];
@@ -159,13 +170,13 @@ function SectionGroup({
             key={occ.id}
             className={`flex items-center justify-between rounded-lg border bg-white p-3 dark:bg-zinc-950 ${toneClass}`}
           >
-            <div>
-              <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+            <Link href={`/${org}/occurrences/${occ.id}`} className="min-w-0 flex-1">
+              <div className="truncate text-sm font-medium text-zinc-900 hover:underline dark:text-zinc-100">
                 {occ.template.title}
               </div>
               <div className="text-xs text-zinc-500">{occ.checkType}</div>
-            </div>
-            {onComplete ? (
+            </Link>
+            {onComplete && !needsInput(occ) ? (
               <button
                 type="button"
                 disabled={pendingId === occ.id}
@@ -174,6 +185,14 @@ function SectionGroup({
               >
                 Complete
               </button>
+            ) : onComplete ? (
+              // A reading/evidence task can't be one-click completed — open the detail form (#159).
+              <Link
+                href={`/${org}/occurrences/${occ.id}`}
+                className="rounded-md border border-zinc-300 px-3 py-1.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-700 dark:text-zinc-300 dark:hover:bg-zinc-900"
+              >
+                Open
+              </Link>
             ) : (
               <span className="text-xs font-medium text-zinc-500">{occ.status}</span>
             )}
