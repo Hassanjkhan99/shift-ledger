@@ -8,12 +8,14 @@ import { headers } from "next/headers";
 import { revalidatePath } from "next/cache";
 import { withTenant } from "@/lib/db";
 import { resolveMemberForOrg, type MemberContext } from "@/lib/http-auth";
+import { canExportAuditPacks } from "@/lib/permissions";
 import { enqueueExport, processExportJob } from "@/lib/exports";
 import { getObjectStore } from "@/lib/storage";
 
 export type ExportActionResult =
   | { status: "ok"; id?: string }
   | { status: "unauthorized" }
+  | { status: "forbidden" }
   | { status: "validation"; issues: unknown[] }
   | { status: "error"; message: string };
 
@@ -47,6 +49,7 @@ export async function enqueueExportAction(raw: unknown): Promise<ExportActionRes
 
   const ctx = await ctxFor(input.organizationId);
   if (!ctx) return { status: "unauthorized" };
+  if (!canExportAuditPacks(ctx.role)) return { status: "forbidden" };
 
   const filters = {
     ...(input.from ? { from: new Date(`${input.from}T00:00:00.000Z`).toISOString() } : {}),
@@ -74,6 +77,7 @@ export async function processExportNowAction(raw: unknown): Promise<ExportAction
 
   const ctx = await ctxFor(input.organizationId);
   if (!ctx) return { status: "unauthorized" };
+  if (!canExportAuditPacks(ctx.role)) return { status: "forbidden" };
 
   try {
     await processExportJob(getObjectStore(), {

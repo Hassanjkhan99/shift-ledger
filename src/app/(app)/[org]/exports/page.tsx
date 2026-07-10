@@ -4,6 +4,7 @@
 import { notFound } from "next/navigation";
 import { headers } from "next/headers";
 import { resolveMemberForOrg } from "@/lib/http-auth";
+import { canExportAuditPacks } from "@/lib/permissions";
 import { withTenant } from "@/lib/db";
 import { listExportJobs } from "@/lib/exports-read";
 import { ExportRequestForm } from "./ExportRequestForm";
@@ -12,7 +13,7 @@ import { ProcessJobButton } from "./ProcessJobButton";
 export default async function ExportsPage({ params }: { params: Promise<{ org: string }> }) {
   const { org } = await params;
   const ctx = await resolveMemberForOrg((await headers()) as unknown as Headers, org);
-  if (!ctx) notFound();
+  if (!ctx || !canExportAuditPacks(ctx.role)) notFound();
 
   const jobs = await withTenant(ctx.organizationId, (tx) => listExportJobs(tx));
 
@@ -51,15 +52,15 @@ export default async function ExportsPage({ params }: { params: Promise<{ org: s
                   </span>
                   {j.downloadable && (
                     <a
-                      href={`/api/exports/${j.id}/download`}
+                      href={`/api/exports/${j.id}/download?o=${org}`}
                       className="rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"
                     >
                       Download
                     </a>
                   )}
-                  {(j.status === "queued" || j.status === "failed") && (
-                    <ProcessJobButton org={org} jobId={j.id} />
-                  )}
+                  {/* Only queued jobs can be processed — the worker skips non-queued, so a "retry" on a
+                      failed job would silently no-op (#161). */}
+                  {j.status === "queued" && <ProcessJobButton org={org} jobId={j.id} />}
                 </span>
               </li>
             ))}

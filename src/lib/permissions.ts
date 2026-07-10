@@ -164,6 +164,23 @@ export function canWriteEvidence(role: OrgRole): boolean {
   return EVIDENCE_WRITE_ROLES.has(role);
 }
 
+// ---- Audit-pack exports authorization (#139, D7) --------------------------------
+// An export currently spans the whole org (date-range filters only), so it's restricted to org-wide
+// roles — Owner/OrgAdmin + read-only Auditor/ExternalInspector (the auditor-facing output). A
+// property-scoped manager would otherwise pull records outside their scope (#152); scoped exports
+// await property/outlet filters.
+const EXPORT_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([
+  OrgRole.Owner,
+  OrgRole.OrgAdmin,
+  OrgRole.Auditor,
+  OrgRole.ExternalInspector,
+]);
+
+/** True if `role` may request + download audit-pack exports (org-wide only, #139/#152). */
+export function canExportAuditPacks(role: OrgRole): boolean {
+  return EXPORT_ROLES.has(role);
+}
+
 // ---- Org & sites management authorization (#133, D7) ----------------------------
 // Organization + property management is org-wide administration: Owner / OrgAdmin only. Outlet
 // management is delegated to the PropertyManager, but ONLY within their property scope (a membership's

@@ -2,6 +2,8 @@ import { describe, it, expect, inject, afterAll } from "vitest";
 import { withTenant, disconnect } from "../src/lib/db";
 import { listExportJobs } from "../src/lib/exports-read";
 import { enqueueExport } from "../src/lib/exports";
+import { canExportAuditPacks } from "../src/lib/permissions";
+import { OrgRole } from "../src/generated/prisma/enums";
 
 // #139 — the exports list read: a queued job appears (not yet downloadable), an activity_log row is
 // written by enqueue, and jobs are tenant-isolated (D6). The worker + signed download are covered by
@@ -50,5 +52,17 @@ describe("exports read (#139)", () => {
     );
     const fromB = await withTenant(orgBId, (tx) => listExportJobs(tx));
     expect(fromB.find((j) => j.id === job.id)).toBeUndefined();
+  });
+
+  it("restricts audit-pack exports to org-wide roles (#152)", () => {
+    // Owner/OrgAdmin + read-only auditor roles (org-wide) may export.
+    expect(canExportAuditPacks(OrgRole.Owner)).toBe(true);
+    expect(canExportAuditPacks(OrgRole.OrgAdmin)).toBe(true);
+    expect(canExportAuditPacks(OrgRole.Auditor)).toBe(true);
+    expect(canExportAuditPacks(OrgRole.ExternalInspector)).toBe(true);
+    // Property-scoped roles cannot (would pull out-of-scope records under date-only filters).
+    expect(canExportAuditPacks(OrgRole.PropertyManager)).toBe(false);
+    expect(canExportAuditPacks(OrgRole.KitchenManager)).toBe(false);
+    expect(canExportAuditPacks(OrgRole.Staff)).toBe(false);
   });
 });
