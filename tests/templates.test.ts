@@ -173,3 +173,107 @@ describe("task templates (#135)", () => {
     expect(fromB).toBeNull();
   });
 });
+
+// #155 review fixes — check_type immutability for in-use templates + titleI18n preservation.
+describe("template edit hazards (#155)", () => {
+  async function scheduleUsing(templateId: string, actorUserId: string): Promise<void> {
+    await withTenant(orgAId, async (tx) => {
+      const outlet = await tx.outlet.findFirstOrThrow({
+        where: { deletedAt: null },
+        select: { id: true, propertyId: true },
+      });
+      await tx.scheduledTask.create({
+        data: {
+          organizationId: orgAId,
+          propertyId: outlet.propertyId,
+          outletId: outlet.id,
+          taskTemplateId: templateId,
+          recurrenceJson: { freq: "daily", interval: 1, timeOfDay: "06:00" },
+          recurrenceFreq: "daily",
+          timeOfDay: new Date("1970-01-01T06:00:00Z"),
+          timezone: "Europe/Berlin",
+          assigneeRole: "KitchenManager",
+          startsOn: new Date(Date.UTC(2026, 0, 1)),
+        },
+      });
+    });
+  }
+
+  it("locks check_type once a schedule references the template", async () => {
+    const actorUserId = await actor(orgAId);
+    const created = await withTenant(orgAId, (tx) =>
+      createTemplate(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        title: `Lock ${randomUUID().slice(0, 6)}`,
+        checkType: "temperature",
+        requiredEvidence: ["temperature"],
+        targetConfig: { minC: 0, maxC: 5 },
+      }),
+    );
+    if (created.status !== "ok") throw new Error("setup failed");
+    await scheduleUsing(created.templateId, actorUserId);
+
+    // Changing check_type on an in-use template is rejected…
+    const locked = await withTenant(orgAId, (tx) =>
+      updateTemplate(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        templateId: created.templateId,
+        title: "Renamed",
+        checkType: "cleaning",
+        requiredEvidence: ["checkbox"],
+      }),
+    );
+    expect(locked.status).toBe("check-type-locked");
+
+    // …but editing other fields with the SAME check_type still works.
+    const ok = await withTenant(orgAId, (tx) =>
+      updateTemplate(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        templateId: created.templateId,
+        title: "Renamed same type",
+        checkType: "temperature",
+        requiredEvidence: ["temperature", "photo"],
+        targetConfig: { minC: 1, maxC: 6 },
+      }),
+    );
+    expect(ok.status).toBe("ok");
+  });
+
+  it("preserves titleI18n when an edit omits it", async () => {
+    const actorUserId = await actor(orgAId);
+    const created = await withTenant(orgAId, (tx) =>
+      createTemplate(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        title: `I18n ${randomUUID().slice(0, 6)}`,
+        titleI18n: { de: "Kühlschrank" },
+        checkType: "generic",
+        requiredEvidence: [],
+      }),
+    );
+    if (created.status !== "ok") throw new Error("setup failed");
+
+    await withTenant(orgAId, (tx) =>
+      updateTemplate(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        templateId: created.templateId,
+        title: "Edited title only",
+        checkType: "generic",
+        requiredEvidence: ["note"],
+        // titleI18n intentionally omitted
+      }),
+    );
+
+    const row = await withTenant(orgAId, (tx) =>
+      tx.taskTemplate.findUnique({
+        where: { id: created.templateId },
+        select: { titleI18n: true },
+      }),
+    );
+    expect(row!.titleI18n).toEqual({ de: "Kühlschrank" });
+  });
+});

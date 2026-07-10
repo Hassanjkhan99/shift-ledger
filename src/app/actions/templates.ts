@@ -19,6 +19,7 @@ export type TemplateActionResult =
   | { status: "unauthorized" }
   | { status: "forbidden" }
   | { status: "not-found" }
+  | { status: "check-type-locked" }
   | { status: "validation"; issues: unknown[] };
 
 async function ctxFor(organizationId: string): Promise<MemberContext | null> {
@@ -87,6 +88,7 @@ export async function updateTemplateAction(raw: unknown): Promise<TemplateAction
     }),
   );
   if (result.status === "not-found") return { status: "not-found" };
+  if (result.status === "check-type-locked") return { status: "check-type-locked" };
   revalidateTemplates(ctx.organizationId, input.templateId);
   return { status: "ok", id: input.templateId };
 }

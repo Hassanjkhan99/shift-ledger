@@ -194,18 +194,13 @@ export function canManageOutlets(
   return false;
 }
 
-// ---- Task templates & scheduling authorship (#135/#136, D7) ---------------------
-// Owner/OrgAdmin/PropertyManager/KitchenManager author templates and schedules.
-const CONFIG_AUTHOR_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([
-  OrgRole.Owner,
-  OrgRole.OrgAdmin,
-  OrgRole.PropertyManager,
-  OrgRole.KitchenManager,
-]);
-
-/** True if `role` may create/edit/deactivate task templates (D7, #135). */
+// ---- Task templates authorship (#135, D7) ---------------------------------------
+// A template is ORG-WIDE config (no property dimension) reused across every site's schedules, so a
+// property-scoped manager editing/deactivating one would affect sites outside their scope (Codex #152).
+// Since there is no scope to check, template authoring is restricted to the org-wide roles.
+/** True if `role` may create/edit/deactivate task templates (org-wide config; Owner/OrgAdmin). */
 export function canManageTemplates(role: OrgRole): boolean {
-  return CONFIG_AUTHOR_ROLES.has(role);
+  return ORG_MANAGER_ROLES.has(role);
 }
 
 // ---- Members & invitations authorization (#134, D7) -----------------------------

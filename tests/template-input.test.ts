@@ -35,10 +35,12 @@ describe("template input validation (#135)", () => {
     ).toBe(false);
   });
 
-  it("gates authoring to Owner/OrgAdmin/PropertyManager/KitchenManager", () => {
+  it("restricts template authoring to org-wide roles (templates are org-wide config, #152)", () => {
     expect(canManageTemplates(OrgRole.Owner)).toBe(true);
-    expect(canManageTemplates(OrgRole.KitchenManager)).toBe(true);
-    expect(canManageTemplates(OrgRole.ShiftLeader)).toBe(false);
+    expect(canManageTemplates(OrgRole.OrgAdmin)).toBe(true);
+    // Scoped managers no longer author org-wide templates (would affect out-of-scope sites).
+    expect(canManageTemplates(OrgRole.PropertyManager)).toBe(false);
+    expect(canManageTemplates(OrgRole.KitchenManager)).toBe(false);
     expect(canManageTemplates(OrgRole.Staff)).toBe(false);
   });
 });

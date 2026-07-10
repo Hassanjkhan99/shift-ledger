@@ -79,6 +79,8 @@ export function TemplateForm({
     else if (result.status === "forbidden")
       setError("You don’t have permission to manage templates.");
     else if (result.status === "not-found") setError("This template no longer exists.");
+    else if (result.status === "check-type-locked")
+      setError("This template is used by a schedule; its check type can’t be changed.");
     else setError("Could not save the template.");
   }
 

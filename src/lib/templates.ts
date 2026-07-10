@@ -35,7 +35,11 @@ export interface TemplateWriteInput {
 }
 
 // No unique constraint on template title (duplicates are allowed), so there is no conflict variant.
-export type TemplateResult = { status: "ok"; templateId: string } | { status: "not-found" };
+// `check-type-locked`: the check_type may not change once the template is referenced by a schedule,
+// because the generator reads the live template check_type each run and would reclassify future
+// occurrences (Codex #155).
+export type TemplateResult =
+  { status: "ok"; templateId: string } | { status: "not-found" } | { status: "check-type-locked" };
 
 function targetConfigJson(input: TemplateWriteInput): Prisma.InputJsonValue | typeof Prisma.DbNull {
   if (input.checkType === "temperature" && input.targetConfig) {
@@ -149,15 +153,33 @@ export async function updateTemplate(
 ): Promise<TemplateResult> {
   const before = await tx.taskTemplate.findFirst({
     where: { id: input.templateId, deletedAt: null },
-    select: { id: true, title: true, checkType: true, requiredEvidence: true },
+    select: {
+      id: true,
+      title: true,
+      checkType: true,
+      requiredEvidence: true,
+      targetConfigJson: true,
+      instructions: true,
+    },
   });
   if (!before) return { status: "not-found" };
+
+  // Once a schedule references this template, the check_type is frozen — the generator reads it live
+  // each run, so changing it would reclassify future occurrences (Codex #155).
+  if (input.checkType !== before.checkType) {
+    const inUse = await tx.scheduledTask.count({
+      where: { taskTemplateId: input.templateId, deletedAt: null },
+    });
+    if (inUse > 0) return { status: "check-type-locked" };
+  }
 
   await tx.taskTemplate.update({
     where: { id: input.templateId },
     data: {
       title: input.title,
-      titleI18n: input.titleI18n ?? Prisma.DbNull,
+      // Preserve existing localized titles when the caller omits titleI18n (Codex #155) — only
+      // overwrite when a value is explicitly supplied.
+      ...(input.titleI18n !== undefined ? { titleI18n: input.titleI18n ?? Prisma.DbNull } : {}),
       checkType: input.checkType,
       requiredEvidence: input.requiredEvidence,
       targetConfigJson: targetConfigJson(input),
@@ -170,8 +192,24 @@ export async function updateTemplate(
     subjectId: input.templateId,
     action: "template.updated",
     actorUserId: input.actorUserId,
-    beforeJson: { title: before.title, checkType: before.checkType },
-    afterJson: { title: input.title, checkType: input.checkType },
+    // Full config in the diff so an evidence/threshold/instructions-only edit is auditable (Codex #156).
+    beforeJson: {
+      title: before.title,
+      checkType: before.checkType,
+      requiredEvidence: before.requiredEvidence,
+      targetConfig: before.targetConfigJson ?? null,
+      instructions: before.instructions,
+    },
+    afterJson: {
+      title: input.title,
+      checkType: input.checkType,
+      requiredEvidence: input.requiredEvidence,
+      targetConfig:
+        input.checkType === "temperature" && input.targetConfig
+          ? { minC: input.targetConfig.minC, maxC: input.targetConfig.maxC }
+          : null,
+      instructions: input.instructions ?? null,
+    },
   });
   return { status: "ok", templateId: input.templateId };
 }
