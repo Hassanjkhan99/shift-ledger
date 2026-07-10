@@ -203,6 +203,37 @@ export function canManageTemplates(role: OrgRole): boolean {
   return ORG_MANAGER_ROLES.has(role);
 }
 
+// ---- Scheduling authorship (#136, D7) -------------------------------------------
+// Unlike templates, a schedule lives at an outlet under a property, so it IS property-scoped: a
+// PropertyManager/KitchenManager may manage schedules only within their property scope (Codex #152).
+const SCHEDULE_AUTHOR_ROLES: ReadonlySet<OrgRole> = new Set<OrgRole>([
+  OrgRole.Owner,
+  OrgRole.OrgAdmin,
+  OrgRole.PropertyManager,
+  OrgRole.KitchenManager,
+]);
+
+/** True if `role` may reach the scheduling screens at all (page-level gate). */
+export function canManageSchedules(role: OrgRole): boolean {
+  return SCHEDULE_AUTHOR_ROLES.has(role);
+}
+
+/**
+ * True if `role` may create/edit/deactivate a schedule whose outlet is under `propertyId`. Owner/OrgAdmin
+ * manage any; PropertyManager/KitchenManager only within their `propertyScope` (empty = whole org).
+ */
+export function canManageScheduleAt(
+  role: OrgRole,
+  propertyScope: readonly string[],
+  propertyId: string,
+): boolean {
+  if (ORG_MANAGER_ROLES.has(role)) return true;
+  if (role === OrgRole.PropertyManager || role === OrgRole.KitchenManager) {
+    return propertyScope.length === 0 || propertyScope.includes(propertyId);
+  }
+  return false;
+}
+
 // ---- Members & invitations authorization (#134, D7) -----------------------------
 // Owner/OrgAdmin manage the whole roster; a PropertyManager may manage members within their scope.
 
