@@ -2,7 +2,9 @@ import { describe, it, expect, inject, afterAll } from "vitest";
 import { randomUUID } from "node:crypto";
 import { withTenant, disconnect } from "../src/lib/db";
 import { createSchedule, getSchedule, setScheduleActive, generateNow } from "../src/lib/schedules";
-import { createTemplate } from "../src/lib/templates";
+import { createTemplate, setTemplateActive } from "../src/lib/templates";
+import { createProperty, createOutlet, archiveProperty } from "../src/lib/sites";
+import { setMembershipStatus } from "../src/lib/members";
 import { upcomingOccurrenceDates } from "../src/lib/recurrence";
 
 // #136 — schedule CRUD + the generator integration: creating a schedule and running generateNow
@@ -225,5 +227,113 @@ describe("schedules (#136)", () => {
     if (created.status !== "ok") throw new Error("setup failed");
     const fromB = await withTenant(orgBId, (tx) => getSchedule(tx, created.scheduleId));
     expect(fromB).toBeNull();
+  });
+});
+
+// #157 review fixes — reject archived-property outlets, inactive templates, inactive assignees.
+describe("scheduling guardrails (#157)", () => {
+  it("rejects an inactive template on create", async () => {
+    const actorUserId = await actor(orgAId);
+    const outletId = await seededOutletId(orgAId);
+    const templateId = await makeTemplate(orgAId, actorUserId);
+    await withTenant(orgAId, (tx) =>
+      setTemplateActive(tx, { organizationId: orgAId, actorUserId, templateId, active: false }),
+    );
+
+    const res = await withTenant(orgAId, (tx) =>
+      createSchedule(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        outletId,
+        taskTemplateId: templateId,
+        recurrence: { freq: "daily", interval: 1, timeOfDay: "06:00" },
+        timezone: "Europe/Berlin",
+        graceMinutes: 15,
+        assigneeRole: "Staff",
+        startsOn: "2026-03-10",
+      }),
+    );
+    expect(res.status).toBe("inactive-template");
+  });
+
+  it("rejects an outlet whose parent property is archived", async () => {
+    const actorUserId = await actor(orgAId);
+    const templateId = await makeTemplate(orgAId, actorUserId);
+    const p = await withTenant(orgAId, (tx) =>
+      createProperty(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        name: `Arch Sched ${randomUUID().slice(0, 6)}`,
+        timezone: "Europe/Berlin",
+        countryCode: "DE",
+      }),
+    );
+    if (p.status !== "ok") throw new Error("setup failed");
+    const o = await withTenant(orgAId, (tx) =>
+      createOutlet(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        propertyId: p.propertyId,
+        name: "K",
+      }),
+    );
+    if (o.status !== "ok") throw new Error("setup failed");
+    await withTenant(orgAId, (tx) =>
+      archiveProperty(tx, { organizationId: orgAId, actorUserId, propertyId: p.propertyId }),
+    );
+
+    const res = await withTenant(orgAId, (tx) =>
+      createSchedule(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        outletId: o.outletId,
+        taskTemplateId: templateId,
+        recurrence: { freq: "daily", interval: 1, timeOfDay: "06:00" },
+        timezone: "Europe/Berlin",
+        graceMinutes: 15,
+        assigneeRole: "Staff",
+        startsOn: "2026-03-10",
+      }),
+    );
+    expect(res.status).toBe("not-found");
+  });
+
+  it("rejects an inactive user assignee (composite FK alone is insufficient)", async () => {
+    const actorUserId = await actor(orgAId);
+    const outletId = await seededOutletId(orgAId);
+    const templateId = await makeTemplate(orgAId, actorUserId);
+    // A user with an INACTIVE membership: the composite FK row exists, but they're not active.
+    const inactiveUserId = await withTenant(orgAId, async (tx) => {
+      const u = await tx.user.create({
+        data: { email: `inactive-${randomUUID()}@example.com`, name: "Inactive" },
+        select: { id: true },
+      });
+      const m = await tx.membership.create({
+        data: { organizationId: orgAId, userId: u.id, role: "Staff", propertyScope: [] },
+        select: { id: true },
+      });
+      await setMembershipStatus(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        membershipId: m.id,
+        active: false,
+      });
+      return u.id;
+    });
+
+    const res = await withTenant(orgAId, (tx) =>
+      createSchedule(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        outletId,
+        taskTemplateId: templateId,
+        recurrence: { freq: "daily", interval: 1, timeOfDay: "06:00" },
+        timezone: "Europe/Berlin",
+        graceMinutes: 15,
+        assigneeUserId: inactiveUserId,
+        startsOn: "2026-03-10",
+      }),
+    );
+    expect(res.status).toBe("invalid-assignee");
   });
 });

@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { randomUUID } from "node:crypto";
 import { createScheduleInput } from "../src/lib/schedule-input";
-import { canManageSchedules } from "../src/lib/permissions";
+import { canManageSchedules, canManageScheduleAt } from "../src/lib/permissions";
 import { OrgRole } from "../src/generated/prisma/enums";
 
 // #136 — schedule validation contract (assignee XOR, grace 0–60, recurrence, date order) + D7 gate.
@@ -87,5 +87,21 @@ describe("schedule input validation (#136)", () => {
     expect(canManageSchedules(OrgRole.KitchenManager)).toBe(true);
     expect(canManageSchedules(OrgRole.ShiftLeader)).toBe(false);
     expect(canManageSchedules(OrgRole.Staff)).toBe(false);
+  });
+
+  it("scopes schedule management to the manager's properties (#152)", () => {
+    const p1 = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const p2 = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+    // Org-admins: any property.
+    expect(canManageScheduleAt(OrgRole.Owner, [], p1)).toBe(true);
+    expect(canManageScheduleAt(OrgRole.OrgAdmin, [p2], p1)).toBe(true);
+    // Scoped PM/KM: in-scope only; empty scope = whole org.
+    expect(canManageScheduleAt(OrgRole.PropertyManager, [p1], p1)).toBe(true);
+    expect(canManageScheduleAt(OrgRole.PropertyManager, [p1], p2)).toBe(false);
+    expect(canManageScheduleAt(OrgRole.KitchenManager, [p1], p1)).toBe(true);
+    expect(canManageScheduleAt(OrgRole.KitchenManager, [p1], p2)).toBe(false);
+    expect(canManageScheduleAt(OrgRole.KitchenManager, [], p1)).toBe(true);
+    // Others never.
+    expect(canManageScheduleAt(OrgRole.Staff, [], p1)).toBe(false);
   });
 });

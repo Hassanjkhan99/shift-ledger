@@ -45,7 +45,8 @@ export interface ScheduleWriteInput {
 export type ScheduleResult =
   | { status: "ok"; scheduleId: string }
   | { status: "not-found" } // outlet or template missing/archived
-  | { status: "invalid-assignee" }; // assignee user is not an active member (composite FK)
+  | { status: "inactive-template" } // selected template is deactivated (#157)
+  | { status: "invalid-assignee" }; // assignee user is not an active member (#157)
 
 function timeOfDayDate(hhmm: string): Date {
   return new Date(`1970-01-01T${hhmm}:00Z`);
@@ -60,12 +61,44 @@ function isFkViolation(err: unknown): boolean {
   return err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2003";
 }
 
+// Resolve the outlet's property, requiring BOTH the outlet and its parent property to be active — a
+// schedule under an archived site never materializes (the generator filters property.deletedAt), so we
+// reject it up front (Codex #157).
 async function resolvePropertyId(tx: TenantClient, outletId: string): Promise<string | null> {
   const outlet = await tx.outlet.findFirst({
-    where: { id: outletId, deletedAt: null },
+    where: { id: outletId, deletedAt: null, property: { deletedAt: null } },
     select: { propertyId: true },
   });
   return outlet?.propertyId ?? null;
+}
+
+/** The property of an outlet if BOTH it and its parent are active — for the action's scope check (#152). */
+export async function outletActiveProperty(
+  tx: TenantClient,
+  outletId: string,
+): Promise<string | null> {
+  return resolvePropertyId(tx, outletId);
+}
+
+/** The property a schedule belongs to (regardless of archived state) — for the action's scope check (#152). */
+export async function schedulePropertyId(
+  tx: TenantClient,
+  scheduleId: string,
+): Promise<string | null> {
+  const s = await tx.scheduledTask.findFirst({
+    where: { id: scheduleId, deletedAt: null },
+    select: { propertyId: true },
+  });
+  return s?.propertyId ?? null;
+}
+
+/** True if `userId` is an ACTIVE, non-deleted member — the composite FK only proves a row exists (#157). */
+async function isActiveMember(tx: TenantClient, userId: string): Promise<boolean> {
+  const m = await tx.membership.findFirst({
+    where: { userId, status: "active", deletedAt: null },
+    select: { id: true },
+  });
+  return m !== null;
 }
 
 /** Common write payload (create + update share it), with propertyId derived from the outlet. */
@@ -100,7 +133,12 @@ export async function loadScheduleFormOptions(
   const scoped = propertyScope.length > 0;
   const [outlets, templates, members] = await Promise.all([
     tx.outlet.findMany({
-      where: { deletedAt: null, ...(scoped ? { propertyId: { in: [...propertyScope] } } : {}) },
+      // Exclude outlets whose parent property is archived (#157) + honor property scope (#152).
+      where: {
+        deletedAt: null,
+        property: { deletedAt: null },
+        ...(scoped ? { propertyId: { in: [...propertyScope] } } : {}),
+      },
       orderBy: { name: "asc" },
       select: { id: true, name: true, property: { select: { name: true, timezone: true } } },
     }),
@@ -126,9 +164,17 @@ export async function loadScheduleFormOptions(
   };
 }
 
-export async function listSchedules(tx: TenantClient): Promise<ScheduleRow[]> {
+/** List schedules. Pass `propertyScope` (non-empty) to limit to those properties — scoped managers
+ * must not see out-of-scope schedules (#152). Omit / empty = whole org (org-admins). */
+export async function listSchedules(
+  tx: TenantClient,
+  propertyScope: readonly string[] = [],
+): Promise<ScheduleRow[]> {
   const rows = await tx.scheduledTask.findMany({
-    where: { deletedAt: null },
+    where: {
+      deletedAt: null,
+      ...(propertyScope.length > 0 ? { propertyId: { in: [...propertyScope] } } : {}),
+    },
     orderBy: [{ isActive: "desc" }, { createdAt: "desc" }],
     select: {
       id: true,
@@ -207,9 +253,13 @@ export async function createSchedule(
   if (!propertyId) return { status: "not-found" };
   const template = await tx.taskTemplate.findFirst({
     where: { id: input.taskTemplateId, deletedAt: null },
-    select: { id: true },
+    select: { id: true, isActive: true },
   });
   if (!template) return { status: "not-found" };
+  if (!template.isActive) return { status: "inactive-template" }; // don't schedule on a retired template
+  if (input.assigneeUserId && !(await isActiveMember(tx, input.assigneeUserId))) {
+    return { status: "invalid-assignee" };
+  }
 
   try {
     const schedule = await tx.scheduledTask.create({
@@ -245,11 +295,35 @@ export async function updateSchedule(
 ): Promise<ScheduleResult> {
   const before = await tx.scheduledTask.findFirst({
     where: { id: input.scheduleId, deletedAt: null },
-    select: { id: true },
+    select: {
+      id: true,
+      outletId: true,
+      taskTemplateId: true,
+      recurrenceJson: true,
+      timezone: true,
+      graceMinutes: true,
+      assigneeRole: true,
+      assigneeUserId: true,
+      startsOn: true,
+      endsOn: true,
+    },
   });
   if (!before) return { status: "not-found" };
   const propertyId = await resolvePropertyId(tx, input.outletId);
   if (!propertyId) return { status: "not-found" };
+  // Only require the template be active when it's being (re)pointed — editing other fields of a schedule
+  // whose template was later deactivated must still work.
+  if (input.taskTemplateId !== before.taskTemplateId) {
+    const template = await tx.taskTemplate.findFirst({
+      where: { id: input.taskTemplateId, deletedAt: null },
+      select: { isActive: true },
+    });
+    if (!template) return { status: "not-found" };
+    if (!template.isActive) return { status: "inactive-template" };
+  }
+  if (input.assigneeUserId && !(await isActiveMember(tx, input.assigneeUserId))) {
+    return { status: "invalid-assignee" };
+  }
 
   try {
     await tx.scheduledTask.update({
@@ -262,7 +336,29 @@ export async function updateSchedule(
       subjectId: input.scheduleId,
       action: "schedule.updated",
       actorUserId: input.actorUserId,
-      afterJson: { outletId: input.outletId, taskTemplateId: input.taskTemplateId },
+      // Full before/after so any field change (recurrence/time/grace/assignee/dates/outlet) is auditable (#156).
+      beforeJson: {
+        outletId: before.outletId,
+        taskTemplateId: before.taskTemplateId,
+        recurrence: before.recurrenceJson as Prisma.InputJsonValue,
+        timezone: before.timezone,
+        graceMinutes: before.graceMinutes,
+        assigneeRole: before.assigneeRole,
+        assigneeUserId: before.assigneeUserId,
+        startsOn: isoDate(before.startsOn),
+        endsOn: before.endsOn ? isoDate(before.endsOn) : null,
+      },
+      afterJson: {
+        outletId: input.outletId,
+        taskTemplateId: input.taskTemplateId,
+        recurrence: input.recurrence as unknown as Prisma.InputJsonValue,
+        timezone: input.timezone,
+        graceMinutes: input.graceMinutes,
+        assigneeRole: input.assigneeRole ?? null,
+        assigneeUserId: input.assigneeUserId ?? null,
+        startsOn: input.startsOn,
+        endsOn: input.endsOn ?? null,
+      },
     });
     return { status: "ok", scheduleId: input.scheduleId };
   } catch (err) {

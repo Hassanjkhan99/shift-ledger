@@ -14,9 +14,12 @@ export default async function SchedulesPage({ params }: { params: Promise<{ org:
   const ctx = await resolveMemberForOrg((await headers()) as unknown as Headers, org);
   if (!ctx || !canManageSchedules(ctx.role)) notFound();
 
+  // Org-admins see every schedule; scoped managers only their properties' (#152). generate-now is
+  // org-wide, so it's admin-only.
+  const isOrgAdmin = ctx.role === "Owner" || ctx.role === "OrgAdmin";
   const { schedules, options } = await withTenant(ctx.organizationId, async (tx) => {
     const [schedules, options] = await Promise.all([
-      listSchedules(tx),
+      listSchedules(tx, isOrgAdmin ? [] : ctx.propertyScope),
       loadScheduleFormOptions(tx, ctx.propertyScope),
     ]);
     return { schedules, options };
@@ -31,7 +34,7 @@ export default async function SchedulesPage({ params }: { params: Promise<{ org:
           Schedules
         </h1>
         <div className="flex items-center gap-2">
-          <GenerateNowButton org={org} />
+          {isOrgAdmin && <GenerateNowButton org={org} />}
           <Link
             href={`/${org}/settings/schedules/new`}
             className="rounded-md bg-zinc-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-zinc-700 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-300"

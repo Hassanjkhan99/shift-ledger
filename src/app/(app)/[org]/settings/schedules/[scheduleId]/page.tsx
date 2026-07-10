@@ -27,6 +27,16 @@ export default async function ScheduleDetailPage({
   });
   if (!schedule) notFound();
 
+  // A scoped manager may not open a schedule outside their property scope (#152); org-admins may (empty scope).
+  const isOrgAdmin = ctx.role === "Owner" || ctx.role === "OrgAdmin";
+  if (
+    !isOrgAdmin &&
+    ctx.propertyScope.length > 0 &&
+    !ctx.propertyScope.includes(schedule.propertyId)
+  ) {
+    notFound();
+  }
+
   return (
     <div className="mx-auto w-full max-w-md space-y-6">
       <div>

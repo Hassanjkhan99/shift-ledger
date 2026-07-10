@@ -176,10 +176,12 @@ export function ScheduleForm({
     setPending(false);
     if (result.status === "invalid-assignee")
       setError("The chosen assignee is not an active member.");
+    else if (result.status === "inactive-template")
+      setError("That template is deactivated — pick an active one.");
     else if (result.status === "validation")
       setError("Please check the recurrence, assignee and grace.");
     else if (result.status === "forbidden")
-      setError("You don’t have permission to manage schedules.");
+      setError("You don’t have permission to manage schedules for this site.");
     else if (result.status === "not-found") setError("The outlet or template no longer exists.");
     else setError("Could not save the schedule.");
   }
