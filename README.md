@@ -40,3 +40,21 @@ as a per-PR migration check. It needs two repo secrets: **`NEON_API_KEY`** and *
    `DATABASE_URL` at the fixed `shift-ledger-dev` branch (both a non-superuser role — never a
    BYPASSRLS/owner role for the app runtime).
 3. Add `NEON_API_KEY` + `NEON_PROJECT_ID` as **GitHub Actions secrets** so the lifecycle workflow can run.
+
+### Migrating production — #168
+
+The Vercel build (`prisma generate && next build`) does **not** migrate any database, and the preview
+workflow above only touches per-PR branches. The [`Migrate production DB`](.github/workflows/prod-migrate.yml)
+workflow keeps the `production` branch in lockstep with `main`: on every push to `main` that changes
+`prisma/**` (and on manual `workflow_dispatch`) it runs `prisma migrate deploy` then
+`scripts/apply-superuser.mjs` against production. Both steps are idempotent.
+
+It needs two **GitHub Actions secrets** (until set, the workflow skips cleanly — no red check), which must
+point at the `production` branch with **elevated** roles (not the runtime app_user):
+
+- **`PROD_MIGRATION_DATABASE_URL`** — an owner/DDL role (migrations create tables + RLS policies).
+- **`PROD_SUPERUSER_DATABASE_URL`** — the superuser role (installs the `SECURITY DEFINER` SQL —
+  `log_activity`, `list_member_organizations`).
+
+First-time backfill of an un-migrated prod DB: set the secrets, then trigger the workflow manually
+(Actions → _Migrate production DB_ → _Run workflow_), or run the two commands locally against production.
