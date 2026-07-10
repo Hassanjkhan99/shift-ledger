@@ -82,6 +82,23 @@ describe("schedule input validation (#136)", () => {
     ).toBe(false);
   });
 
+  it("rejects an impossible calendar date (#161)", () => {
+    expect(
+      createScheduleInput.safeParse({
+        ...base,
+        assigneeRole: OrgRole.Staff,
+        startsOn: "2026-02-31",
+      }).success,
+    ).toBe(false);
+    expect(
+      createScheduleInput.safeParse({
+        ...base,
+        assigneeRole: OrgRole.Staff,
+        startsOn: "2026-02-28",
+      }).success,
+    ).toBe(true);
+  });
+
   it("gates authorship to Owner/OrgAdmin/PropertyManager/KitchenManager", () => {
     expect(canManageSchedules(OrgRole.PropertyManager)).toBe(true);
     expect(canManageSchedules(OrgRole.KitchenManager)).toBe(true);

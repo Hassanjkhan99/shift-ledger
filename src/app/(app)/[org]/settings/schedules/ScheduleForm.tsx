@@ -65,6 +65,16 @@ function parseMonthDays(s: string): number[] {
     .filter((n) => Number.isInteger(n) && n >= 1 && n <= 31);
 }
 
+/** A non-empty monthly-days entry containing any token that isn't a valid 1–31 day (#161). Silently
+ * dropping such a token would save a different recurrence than the author typed. */
+function hasInvalidMonthDayToken(s: string): boolean {
+  return s
+    .split(",")
+    .map((t) => t.trim())
+    .filter((t) => t.length > 0)
+    .some((t) => !/^\d+$/.test(t) || Number(t) < 1 || Number(t) > 31);
+}
+
 export function ScheduleForm({
   org,
   mode,
@@ -145,6 +155,10 @@ export function ScheduleForm({
     setError(null);
     if (!outletId || !templateId) {
       setError("Pick an outlet and a template.");
+      return;
+    }
+    if (freq === RecurrenceFreq.monthly && hasInvalidMonthDayToken(byMonthDay)) {
+      setError("Days of month must be numbers between 1 and 31.");
       return;
     }
     if (!parsedRec.success) {
