@@ -1,0 +1,88 @@
+name: Migrate production DB
+
+# Keep the PRODUCTION Neon branch's schema in lockstep with `main` (#168). The Vercel build only runs
+# `prisma generate && next build` — it never migrates — and the Neon preview workflow only touches per-PR
+# branches, so nothing applied migrations to production. Result: any DB write 500s against a stale prod
+# schema (observed on sign-up once #164 let requests past the origin check). This workflow closes that gap.
+#
+# Runs on every push to main that changes the schema (and on demand), BEFORE the app depends on it:
+#   1. `prisma migrate deploy`            — apply pending migrations (needs an owner/DDL role)
+#   2. `node scripts/apply-superuser.mjs` — (re)install the SECURITY DEFINER SQL: log_activity,
+#                                            list_member_organizations, etc. (needs the superuser role)
+# Both steps are idempotent, so re-runs are safe.
+#
+# Required repository secrets (set once — until then the workflow skips cleanly, no red check):
+#   PROD_MIGRATION_DATABASE_URL  Neon PRODUCTION branch URL for a role with DDL/owner rights (creates
+#                                tables + RLS policies). NOT the runtime app_user role.
+#   PROD_SUPERUSER_DATABASE_URL  Neon PRODUCTION branch URL for the superuser role (GRANT/DEFINER SQL).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "prisma/migrations/**"
+      - "prisma/superuser/**"
+      - "prisma/schema.prisma"
+      - ".github/workflows/prod-migrate.yml"
+  workflow_dispatch: {} # allow a manual run (e.g. first-time backfill of an un-migrated prod DB)
+
+# Never let two migration runs overlap against the same database.
+concurrency:
+  group: prod-migrate
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # `secrets` can't be read in a job-level `if`, so surface their presence as an output the real job gates
+  # on. Lets this file merge safely before the one-time secret setup is done — it just skips (green).
+  guard:
+    runs-on: ubuntu-latest
+    outputs:
+      enabled: ${{ steps.check.outputs.enabled }}
+    steps:
+      - id: check
+        env:
+          PROD_MIGRATION_DATABASE_URL: ${{ secrets.PROD_MIGRATION_DATABASE_URL }}
+          PROD_SUPERUSER_DATABASE_URL: ${{ secrets.PROD_SUPERUSER_DATABASE_URL }}
+        run: |
+          if [ -n "$PROD_MIGRATION_DATABASE_URL" ] && [ -n "$PROD_SUPERUSER_DATABASE_URL" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Prod migration secrets not set (PROD_MIGRATION_DATABASE_URL / PROD_SUPERUSER_DATABASE_URL) — skipping. See README." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+  migrate:
+    name: Apply migrations + superuser SQL to production
+    needs: guard
+    if: ${{ needs.guard.outputs.enabled == 'true' }}
+    runs-on: ubuntu-latest
+    # Bind to a GitHub Environment so prod DB URLs live behind environment protection / approvals.
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+
+      - run: npx prisma generate
+
+      # Owner/DDL role: migrations create tables + RLS policies the app_user role can't.
+      - name: Apply migrations (prisma migrate deploy)
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.PROD_MIGRATION_DATABASE_URL }}
+
+      # Superuser role: (re)install SECURITY DEFINER functions + grants. Idempotent.
+      - name: Apply superuser SQL
+        run: node scripts/apply-superuser.mjs
+        env:
+          SUPERUSER_DATABASE_URL: ${{ secrets.PROD_SUPERUSER_DATABASE_URL }}
+
+      - name: Summary
+        run: echo "Production DB migrated to head + superuser SQL applied." >> "$GITHUB_STEP_SUMMARY"
