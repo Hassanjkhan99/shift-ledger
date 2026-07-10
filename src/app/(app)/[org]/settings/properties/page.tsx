@@ -20,7 +20,9 @@ export default async function PropertiesPage({ params }: { params: Promise<{ org
   const ctx = await resolveMemberForOrg((await headers()) as unknown as Headers, org);
   if (!ctx || !SETTINGS_ROLES.has(ctx.role)) notFound();
 
-  const scoped = ctx.propertyScope.length > 0;
+  // Only PropertyManagers are limited to their scope; Owner/OrgAdmin manage every site even if their
+  // membership happens to carry a non-empty propertyScope (#161).
+  const scoped = !canManageProperties(ctx.role) && ctx.propertyScope.length > 0;
   const properties = await withTenant(ctx.organizationId, (tx) =>
     tx.property.findMany({
       where: { deletedAt: null, ...(scoped ? { id: { in: ctx.propertyScope } } : {}) },

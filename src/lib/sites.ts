@@ -11,6 +11,15 @@
 import type { TenantClient } from "./db";
 import { logActivity } from "./transition";
 import { Prisma } from "../generated/prisma/client";
+import { OccurrenceStatus } from "../generated/prisma/enums";
+
+// Non-terminal occurrence states — the ones still "live" on Today. When a site is archived these are
+// tombstoned (soft-deleted) so they stop being actionable; terminal states are kept for the audit trail.
+const NON_TERMINAL_OCCURRENCE: OccurrenceStatus[] = [
+  OccurrenceStatus.pending,
+  OccurrenceStatus.due,
+  OccurrenceStatus.overdue,
+];
 
 /** Optional freeform postal address, stored in properties.address_json as { text }. */
 function toAddressJson(address: string | undefined): Prisma.InputJsonValue | undefined {
@@ -89,7 +98,7 @@ export async function updateProperty(
 ): Promise<UpdatePropertyResult> {
   const before = await tx.property.findFirst({
     where: { id: input.propertyId, deletedAt: null },
-    select: { id: true, name: true, timezone: true, countryCode: true },
+    select: { id: true, name: true, timezone: true, countryCode: true, addressJson: true },
   });
   if (!before) return { status: "not-found" };
 
@@ -102,7 +111,8 @@ export async function updateProperty(
         countryCode: input.countryCode.toUpperCase(),
         addressJson: toAddressJson(input.address) ?? Prisma.DbNull,
       },
-      select: { name: true, timezone: true, countryCode: true },
+      // Include addressJson so an address-only edit produces a non-empty audit diff (#156).
+      select: { name: true, timezone: true, countryCode: true, addressJson: true },
     });
     await logActivity(tx, {
       organizationId: input.organizationId,
@@ -110,8 +120,18 @@ export async function updateProperty(
       subjectId: input.propertyId,
       action: "property.updated",
       actorUserId: input.actorUserId,
-      beforeJson: { name: before.name, timezone: before.timezone, countryCode: before.countryCode },
-      afterJson: after,
+      beforeJson: {
+        name: before.name,
+        timezone: before.timezone,
+        countryCode: before.countryCode,
+        addressJson: before.addressJson ?? null,
+      },
+      afterJson: {
+        name: after.name,
+        timezone: after.timezone,
+        countryCode: after.countryCode,
+        addressJson: after.addressJson ?? null,
+      },
     });
     return { status: "ok" };
   } catch (err) {
@@ -137,9 +157,21 @@ export async function archiveProperty(
   });
   if (!before) return { status: "not-found" };
 
+  const now = new Date();
   await tx.property.update({
     where: { id: input.propertyId },
-    data: { deletedAt: new Date() },
+    data: { deletedAt: now },
+  });
+  // Tombstone the site's still-live occurrences so they drop off Today and stop being actionable
+  // (#158). Terminal occurrences are left intact for the audit trail. Covers every outlet under the
+  // property via propertyId; RLS scopes this to the current tenant.
+  const tombstoned = await tx.taskOccurrence.updateMany({
+    where: {
+      propertyId: input.propertyId,
+      deletedAt: null,
+      status: { in: NON_TERMINAL_OCCURRENCE },
+    },
+    data: { deletedAt: now },
   });
   await logActivity(tx, {
     organizationId: input.organizationId,
@@ -148,6 +180,7 @@ export async function archiveProperty(
     action: "property.archived",
     actorUserId: input.actorUserId,
     beforeJson: { name: before.name },
+    afterJson: { tombstonedOccurrences: tombstoned.count },
   });
   return { status: "ok" };
 }
@@ -253,9 +286,19 @@ export async function archiveOutlet(
   });
   if (!before) return { status: "not-found" };
 
+  const now = new Date();
   await tx.outlet.update({
     where: { id: input.outletId },
-    data: { deletedAt: new Date() },
+    data: { deletedAt: now },
+  });
+  // Tombstone the outlet's still-live occurrences so they drop off Today (#158); keep terminal ones.
+  const tombstoned = await tx.taskOccurrence.updateMany({
+    where: {
+      outletId: input.outletId,
+      deletedAt: null,
+      status: { in: NON_TERMINAL_OCCURRENCE },
+    },
+    data: { deletedAt: now },
   });
   await logActivity(tx, {
     organizationId: input.organizationId,
@@ -264,6 +307,7 @@ export async function archiveOutlet(
     action: "outlet.archived",
     actorUserId: input.actorUserId,
     beforeJson: { name: before.name },
+    afterJson: { tombstonedOccurrences: tombstoned.count },
   });
   return { status: "ok" };
 }

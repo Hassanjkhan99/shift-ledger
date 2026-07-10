@@ -291,3 +291,140 @@ describe("outlet CRUD (#133)", () => {
     });
   });
 });
+
+// #156 / #158 — review fixes: address-inclusive audit snapshots + occurrence tombstoning on archive.
+describe("archive review fixes (#156/#158)", () => {
+  /** Insert a minimal occurrence (with its template + scheduled task) under a property/outlet. */
+  async function seedOccurrence(
+    propertyId: string,
+    outletId: string,
+    status: "pending" | "completed",
+  ): Promise<string> {
+    return withTenant(orgAId, async (tx) => {
+      const template = await tx.taskTemplate.create({
+        data: {
+          organizationId: orgAId,
+          checkType: "generic",
+          title: name("Arch Tpl"),
+        },
+        select: { id: true },
+      });
+      const schedule = await tx.scheduledTask.create({
+        data: {
+          organizationId: orgAId,
+          propertyId,
+          outletId,
+          taskTemplateId: template.id,
+          recurrenceJson: { freq: "daily", interval: 1, timeOfDay: "06:00" },
+          recurrenceFreq: "daily",
+          timeOfDay: new Date("1970-01-01T06:00:00Z"),
+          timezone: "Europe/Berlin",
+          assigneeRole: "KitchenManager",
+          startsOn: new Date(Date.UTC(2026, 0, 1)),
+        },
+        select: { id: true },
+      });
+      const occ = await tx.taskOccurrence.create({
+        data: {
+          organizationId: orgAId,
+          propertyId,
+          outletId,
+          scheduledTaskId: schedule.id,
+          taskTemplateId: template.id,
+          checkType: "generic",
+          occurrenceLocalDate: new Date(Date.UTC(2026, 0, status === "pending" ? 2 : 3)),
+          dueAt: new Date("2026-01-02T06:00:00Z"),
+          timezone: "Europe/Berlin",
+          status,
+          assigneeRole: "KitchenManager",
+        },
+        select: { id: true },
+      });
+      return occ.id;
+    });
+  }
+
+  it("archiving a property tombstones its live occurrences but keeps terminal ones (#158)", async () => {
+    const actorUserId = await makeUser(orgAId);
+    const p = await withTenant(orgAId, (tx) =>
+      createProperty(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        name: name("Arch Prop"),
+        timezone: "Europe/Berlin",
+        countryCode: "DE",
+      }),
+    );
+    if (p.status !== "ok") throw new Error("setup failed");
+    const o = await withTenant(orgAId, (tx) =>
+      createOutlet(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        propertyId: p.propertyId,
+        name: "K",
+      }),
+    );
+    if (o.status !== "ok") throw new Error("setup failed");
+
+    const pendingOcc = await seedOccurrence(p.propertyId, o.outletId, "pending");
+    const doneOcc = await seedOccurrence(p.propertyId, o.outletId, "completed");
+
+    await withTenant(orgAId, (tx) =>
+      archiveProperty(tx, { organizationId: orgAId, actorUserId, propertyId: p.propertyId }),
+    );
+
+    await withTenant(orgAId, async (tx) => {
+      const pending = await tx.taskOccurrence.findUnique({
+        where: { id: pendingOcc },
+        select: { deletedAt: true },
+      });
+      const done = await tx.taskOccurrence.findUnique({
+        where: { id: doneOcc },
+        select: { deletedAt: true },
+      });
+      expect(pending!.deletedAt).not.toBeNull(); // live occurrence tombstoned
+      expect(done!.deletedAt).toBeNull(); // terminal occurrence preserved for audit
+    });
+  });
+
+  it("property update records address changes in the audit snapshot (#156)", async () => {
+    const actorUserId = await makeUser(orgAId);
+    const created = await withTenant(orgAId, (tx) =>
+      createProperty(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        name: name("Addr Prop"),
+        timezone: "Europe/Berlin",
+        countryCode: "DE",
+        address: "1 Old St",
+      }),
+    );
+    if (created.status !== "ok") throw new Error("setup failed");
+
+    await withTenant(orgAId, (tx) =>
+      updateProperty(tx, {
+        organizationId: orgAId,
+        actorUserId,
+        propertyId: created.propertyId,
+        name: name("Addr Prop"),
+        timezone: "Europe/Berlin",
+        countryCode: "DE",
+        address: "2 New Ave",
+      }),
+    );
+
+    const audit = await withTenant(orgAId, (tx) =>
+      tx.activityLog.findFirst({
+        where: { subjectId: created.propertyId, action: "property.updated" },
+        orderBy: { seq: "desc" },
+        select: { beforeJson: true, afterJson: true },
+      }),
+    );
+    expect((audit!.beforeJson as { addressJson?: unknown }).addressJson).toEqual({
+      text: "1 Old St",
+    });
+    expect((audit!.afterJson as { addressJson?: unknown }).addressJson).toEqual({
+      text: "2 New Ave",
+    });
+  });
+});

@@ -23,14 +23,17 @@ export function PropertyForm({
   org,
   mode,
   initial,
+  defaultTimezone,
 }: {
   org: string;
   mode: "create" | "edit";
   initial?: PropertyInitial;
+  /** Org default timezone, used to prefill a NEW property (#161) instead of a hard-coded zone. */
+  defaultTimezone?: string;
 }) {
   const router = useRouter();
   const [name, setName] = useState(initial?.name ?? "");
-  const [timezone, setTimezone] = useState(initial?.timezone ?? "Europe/Berlin");
+  const [timezone, setTimezone] = useState(initial?.timezone ?? defaultTimezone ?? "Europe/Berlin");
   const [countryCode, setCountryCode] = useState(initial?.countryCode ?? "DE");
   const [address, setAddress] = useState(initial?.address ?? "");
   const [error, setError] = useState<string | null>(null);

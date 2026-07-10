@@ -27,8 +27,8 @@ export default async function PropertyDetailPage({
   const ctx = await resolveMemberForOrg((await headers()) as unknown as Headers, org);
   if (!ctx || !SETTINGS_ROLES.has(ctx.role)) notFound();
 
-  // A scoped PropertyManager may only reach properties in their scope.
-  const scoped = ctx.propertyScope.length > 0;
+  // A scoped PropertyManager may only reach properties in their scope; Owner/OrgAdmin reach any (#161).
+  const scoped = !canManageProperties(ctx.role) && ctx.propertyScope.length > 0;
   if (scoped && !ctx.propertyScope.includes(propertyId)) notFound();
 
   const data = await withTenant(ctx.organizationId, async (tx) => {
