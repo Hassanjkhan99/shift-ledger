@@ -5,7 +5,7 @@
 import { withTenant } from "../../../../../lib/db";
 import { logger } from "../../../../../lib/logger";
 import { getObjectStore, type ObjectStore } from "../../../../../lib/storage";
-import { resolveMemberContext, type MemberContext } from "../../../../../lib/http-auth";
+import { resolveMemberForOrg, type MemberContext } from "../../../../../lib/http-auth";
 
 const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 
@@ -54,7 +54,13 @@ export async function GET(
 ): Promise<Response> {
   const { id } = await ctx.params;
   return handleExportDownload(req, id, {
-    resolveContext: resolveMemberContext,
+    // A browser following the download <a> sends cookies but no x-organization-id header, so read the
+    // org from the ?o= query (the UI adds it), falling back to the header for API callers (#154).
+    resolveContext: (r) => {
+      const orgId =
+        new URL(r.url).searchParams.get("o") ?? r.headers.get("x-organization-id") ?? "";
+      return orgId ? resolveMemberForOrg(r.headers, orgId) : Promise.resolve(null);
+    },
     store: getObjectStore(),
   });
 }
