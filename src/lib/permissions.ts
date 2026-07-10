@@ -194,6 +194,15 @@ export function canManageOutlets(
   return false;
 }
 
+// ---- Task templates authorship (#135, D7) ---------------------------------------
+// A template is ORG-WIDE config (no property dimension) reused across every site's schedules, so a
+// property-scoped manager editing/deactivating one would affect sites outside their scope (Codex #152).
+// Since there is no scope to check, template authoring is restricted to the org-wide roles.
+/** True if `role` may create/edit/deactivate task templates (org-wide config; Owner/OrgAdmin). */
+export function canManageTemplates(role: OrgRole): boolean {
+  return ORG_MANAGER_ROLES.has(role);
+}
+
 // ---- Members & invitations authorization (#134, D7) -----------------------------
 // Owner/OrgAdmin manage the whole roster; a PropertyManager may manage members within their scope.
 
